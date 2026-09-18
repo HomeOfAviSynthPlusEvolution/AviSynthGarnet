@@ -1,4 +1,9 @@
 require_relative 'lib/filters'
+fn = AVS[:avs_lambda]
+raise 'function call' unless fn.call(21) == 42
+raise 'named function call' unless AVS[:avs_named_lambda].call(VaLuE: 21) == 42
+AVS[:ruby_returned_lambda] = fn
+raise 'function array' unless AVS.GarnetCall(fn, 21) == 42
 raise 'AVS input missing' unless AVS[:avs_input] == 17
 AVS[:ruby_output] = 42
 AVS.set_global_var(:garnet_global, false)

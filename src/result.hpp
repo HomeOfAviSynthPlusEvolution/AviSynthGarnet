@@ -27,6 +27,8 @@ struct Storage {
       pin.release(pin.owner);
     if (value.type == GARNET_CLIP && value.as.handle && host.release_clip)
       host.release_clip(host.identity, value.as.handle);
+    if (value.type == GARNET_FUNCTION && value.as.handle && host.release_function)
+      host.release_function(host.identity, value.as.handle);
   }
   void set_string(std::string s) {
     string = std::move(s);

@@ -70,6 +70,10 @@ static garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_st
   } else if (equal(name, "Source")) {
     CHECK(count == 0);
     return clip_result(host);
+  } else if (equal(name, "Lambda")) {
+    r = clip_result(host);
+    r.value.type = GARNET_FUNCTION;
+    return r;
   } else if (equal(name, "Resize")) {
     CHECK(count == 3 && args[0].type == GARNET_CLIP && names[0].size == 0);
     CHECK(equal(names[1], "width") && args[1].as.integer == 320);
@@ -124,6 +128,21 @@ static garnet_result GARNET_CALL set_var(void* identity, void* context, garnet_s
   host->variable = *value;
   return r;
 }
+static garnet_result GARNET_CALL retain_function(void* identity, void* handle) {
+  garnet_result r = retain(identity, handle);
+  r.value.type = GARNET_FUNCTION;
+  return r;
+}
+static garnet_result GARNET_CALL invoke_function(void* identity, void* context, void* handle, const garnet_value* args,
+                                                 const garnet_string* names, size_t count) {
+  fake_host* host = (fake_host*)identity;
+  garnet_result r = {0};
+  CHECK(((fake_clip*)handle)->host == host && context == &host->context);
+  CHECK(count == 1 && args[0].type == GARNET_INT && names[0].size == 0);
+  r.value.type = GARNET_INT;
+  r.value.as.integer = args[0].as.integer * 2;
+  return r;
+}
 static garnet_host api(fake_host* host) {
   garnet_host result = {GARNET_CONTRACT_REVISION,
                         sizeof(garnet_host),
@@ -133,7 +152,10 @@ static garnet_host api(fake_host* host) {
                         free_clip,
                         register_filter,
                         get_var,
-                        set_var};
+                        set_var,
+                        retain_function,
+                        free_clip,
+                        invoke_function};
   return result;
 }
 static garnet_session* create(fake_host* host) {
@@ -201,6 +223,12 @@ int main(int argc, char** argv) {
   release_result(r);
   r = eval(&host, "AVS.Reenter");
   CHECK(r.status == GARNET_OK);
+  release_result(r);
+  r = eval(&host, "$fn = AVS.Lambda; GC.start; $fn.call(21)");
+  CHECK(r.status == GARNET_OK && r.value.as.integer == 42);
+  release_result(r);
+  r = eval(&host, "AVS.send(:remove_const, :Function); GC.start; AVS.Lambda");
+  CHECK(r.status == GARNET_OK && r.value.type == GARNET_FUNCTION);
   release_result(r);
   r = eval(&host, "raise unless AVS.get_var(:test, 42) == 42; AVS[:test] = false; raise unless AVS[:test] == false; "
                   "AVS.set_global_var(:test, 0); AVS.get_var(:test, 42)");

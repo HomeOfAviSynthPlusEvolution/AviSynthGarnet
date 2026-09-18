@@ -6,7 +6,7 @@ module AVS
   # only need a readable schema and a block (or a block delegating to a class).
   def self.filter(name, args: {}, options: {}, &body)
     raise ArgumentError, 'AVS.filter requires a block' unless body
-    types = {clip: 'c', bool: 'b', int: 'i', float: 'f', string: 's', any: '.'}
+    types = {clip: 'c', bool: 'b', int: 'i', float: 'f', string: 's', func: 'n', any: '.'}
     seen = {}
     signature = ''
     [args, options].each_with_index do |schema, kind|

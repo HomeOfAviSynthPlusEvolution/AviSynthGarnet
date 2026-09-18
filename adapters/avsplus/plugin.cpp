@@ -17,6 +17,10 @@ struct Clip {
   Host* host;
   PClip clip;
 };
+struct Function {
+  Host* host;
+  AVSValue value;
+};
 struct Host {
   garnet_host api{};
   garnet_session* session = nullptr;
@@ -25,6 +29,9 @@ struct Host {
 };
 void GARNET_CALL release_clip(void*, void* p) {
   delete static_cast<Clip*>(p);
+}
+void GARNET_CALL release_function(void*, void* p) {
+  delete static_cast<Function*>(p);
 }
 std::unique_ptr<Storage> from_avs(Host& host, const AVSValue& v, int depth = 0) {
   if (depth > 32)
@@ -52,8 +59,13 @@ std::unique_ptr<Storage> from_avs(Host& host, const AVSValue& v, int depth = 0) 
     for (int i = 0; i < v.ArraySize(); ++i)
       p->children.push_back(from_avs(host, v[i], depth + 1));
     p->finish_array();
+  } else if (v.IsFunction()) {
+    auto function = std::make_unique<Function>(Function{&host, v});
+    p->host = host.api;
+    p->value.type = GARNET_FUNCTION;
+    p->value.as.handle = function.release();
   } else
-    throw std::runtime_error("AVS function values are not yet supported");
+    throw std::runtime_error("Unsupported AVS value");
   return p;
 }
 AVSValue to_avs(Host& host, IScriptEnvironment* env, const garnet_value& v, int depth = 0) {
@@ -88,6 +100,12 @@ AVSValue to_avs(Host& host, IScriptEnvironment* env, const garnet_value& v, int 
         values.push_back(to_avs(host, env, v.as.array.data[i], depth + 1));
       return AVSValue(values.data(), static_cast<int>(values.size()));
     }
+    case GARNET_FUNCTION: {
+      auto* function = static_cast<Function*>(v.as.handle);
+      if (!function || function->host != &host)
+        throw std::runtime_error("Cross-host or null function");
+      return function->value;
+    }
     default:
       throw std::runtime_error("Unknown Garnet value type");
   }
@@ -105,6 +123,21 @@ garnet_result GARNET_CALL retain_clip(void* identity, void* handle) {
     return error(e.what());
   } catch (...) {
     return error("Unknown clip retain failure");
+  }
+}
+garnet_result GARNET_CALL retain_function(void* identity, void* handle) {
+  try {
+    auto& host = *static_cast<Host*>(identity);
+    auto* function = static_cast<Function*>(handle);
+    if (!function || function->host != &host)
+      return error("Cross-host or null function");
+    return result(from_avs(host, function->value));
+  } catch (const AvisynthError& e) {
+    return error(e.msg);
+  } catch (const std::exception& e) {
+    return error(e.what());
+  } catch (...) {
+    return error("Unknown function retain failure");
   }
 }
 garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string name, const garnet_value* args,
@@ -138,6 +171,31 @@ garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string na
     return error(e.what());
   } catch (...) {
     return error("Unknown native invocation failure");
+  }
+}
+struct LocalContext {
+  IScriptEnvironment* env;
+  explicit LocalContext(IScriptEnvironment* env) : env(env) { env->PushContext(); }
+  ~LocalContext() { env->PopContext(); }
+};
+garnet_result GARNET_CALL invoke_function(void* identity, void* context, void* handle, const garnet_value* args,
+                                          const garnet_string* names, size_t count) {
+  try {
+    auto* function = static_cast<Function*>(handle);
+    if (!context || !function || function->host != identity)
+      return error("Invalid function invocation");
+    auto* env = static_cast<IScriptEnvironment*>(context);
+    LocalContext local(env);
+    // Public Invoke resolves function-valued variables. Avoid AsFunction(),
+    // which has no public linkage entry, and never inspect AVSValue layout.
+    env->SetVar("__garnet_function", function->value);
+    return invoke(identity, context, span("__garnet_function"), args, names, count);
+  } catch (const AvisynthError& e) {
+    return error(e.msg);
+  } catch (const std::exception& e) {
+    return error(e.what());
+  } catch (...) {
+    return error("Unknown function invocation failure");
   }
 }
 std::string variable_name(garnet_string name) {
@@ -267,7 +325,10 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
                  release_clip,
                  register_filter,
                  get_var,
-                 set_var};
+                 set_var,
+                 retain_function,
+                 release_function,
+                 invoke_function};
     ResultGuard r(garnet_create(&host->api, &host->session));
     r.check();
     env->AtExit(shutdown, host.get());

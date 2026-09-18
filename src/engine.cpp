@@ -28,6 +28,7 @@ struct garnet_session {
   garnet_host host{};
   mrb_state* ruby = nullptr;
   RClass* clip_class = nullptr;
+  RClass* function_class = nullptr;
   void* call_context = nullptr;
   std::recursive_mutex gate;
   bool active = false;
@@ -90,6 +91,20 @@ void free_clip(mrb_state*, void* p) {
   delete static_cast<Clip*>(p);
 }
 const mrb_data_type clip_type{"AVS::Clip", free_clip};
+struct Function {
+  void* identity;
+  ResultGuard retained;
+  Function(const garnet_host& host, void* handle)
+      : identity(host.identity), retained(host.retain_function(host.identity, handle)) {
+    retained.check();
+    if (retained.value.value.type != GARNET_FUNCTION || !retained.value.value.as.handle)
+      throw std::runtime_error("Invalid retained function");
+  }
+};
+void free_function(mrb_state*, void* p) {
+  delete static_cast<Function*>(p);
+}
+const mrb_data_type function_type{"AVS::Function", free_function};
 
 std::unique_ptr<Storage> from_ruby(mrb_state* mrb, mrb_value value, int depth = 0) {
   if (depth > 32)
@@ -123,8 +138,17 @@ std::unique_ptr<Storage> from_ruby(mrb_state* mrb, mrb_value value, int depth = 
     if (out->pin.status != GARNET_OK)
       throw std::runtime_error(text(out->pin.error));
     out->value = out->pin.value;
+  } else if (mrb_data_p(value) && DATA_TYPE(value) == &function_type && DATA_PTR(value)) {
+    auto& s = session(mrb);
+    auto* function = static_cast<Function*>(DATA_PTR(value));
+    if (function->identity != s.host.identity)
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "Cross-host function");
+    out->pin = s.host.retain_function(s.host.identity, function->retained.value.value.as.handle);
+    if (out->pin.status != GARNET_OK)
+      throw std::runtime_error(text(out->pin.error));
+    out->value = out->pin.value;
   } else
-    mrb_raise(mrb, E_TYPE_ERROR, "Expected nil, bool, integer, float, string, array or AVS::Clip");
+    mrb_raise(mrb, E_TYPE_ERROR, "Expected nil, bool, integer, float, string, array, AVS::Clip or AVS::Function");
   return out;
 }
 
@@ -155,6 +179,12 @@ mrb_value to_ruby(mrb_state* mrb, const garnet_value& value, int depth = 0) {
     case GARNET_CLIP: {
       auto p = std::make_unique<Clip>(session(mrb).host, value.as.handle);
       auto* object = mrb_data_object_alloc(mrb, session(mrb).clip_class, p.get(), &clip_type);
+      p.release();
+      return mrb_obj_value(object);
+    }
+    case GARNET_FUNCTION: {
+      auto p = std::make_unique<Function>(session(mrb).host, value.as.handle);
+      auto* object = mrb_data_object_alloc(mrb, session(mrb).function_class, p.get(), &function_type);
       p.release();
       return mrb_obj_value(object);
     }
@@ -199,7 +229,7 @@ void validate_signature(const std::string& signature) {
         throw std::runtime_error("Invalid or duplicate exported parameter name");
       i = end + 1;
     }
-    if (i == signature.size() || std::string("cbifs.").find(signature[i++]) == std::string::npos)
+    if (i == signature.size() || std::string("cbifsn.").find(signature[i++]) == std::string::npos)
       throw std::runtime_error("Unsupported exported parameter type");
   }
 }
@@ -235,17 +265,18 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
   mrb_int count;
   mrb_kwargs kwargs{0, 0, nullptr, nullptr, &keywords};
   mrb_get_args(mrb, "*:&", &values, &count, &kwargs, &block);
-  if (count < 1)
+  const bool function_call = mrb_data_p(self) && DATA_TYPE(self) == &function_type && DATA_PTR(self);
+  if (!function_call && count < 1)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "Expected filter name");
   if (!mrb_nil_p(block))
     mrb_raise(mrb, E_ARGUMENT_ERROR, "Native filter blocks are not yet supported");
   try {
-    const auto name = name_of(mrb, values[0]);
+    const auto name = function_call ? std::string() : name_of(mrb, values[0]);
     std::vector<std::unique_ptr<Storage>> owned;
     std::vector<std::string> names;
     if (mrb_data_p(self) && DATA_TYPE(self) == &clip_type)
       owned.push_back(from_ruby(mrb, self));
-    for (mrb_int i = 1; i < count; ++i)
+    for (mrb_int i = function_call ? 0 : 1; i < count; ++i)
       owned.push_back(from_ruby(mrb, values[i]));
     const size_t positional = owned.size();
     if (!mrb_nil_p(keywords)) {
@@ -274,8 +305,12 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
     for (const auto& n : names)
       arg_names.push_back(span(n));
     auto& s = session(mrb);
+    auto* function = function_call ? static_cast<Function*>(DATA_PTR(self)) : nullptr;
     ResultGuard r(
-        s.host.invoke(s.host.identity, s.call_context, span(name), args.data(), arg_names.data(), args.size()));
+        function
+            ? s.host.invoke_function(s.host.identity, s.call_context, function->retained.value.value.as.handle,
+                                     args.data(), arg_names.data(), args.size())
+            : s.host.invoke(s.host.identity, s.call_context, span(name), args.data(), arg_names.data(), args.size()));
     r.check();
     return to_ruby(mrb, r.value.value);
   } catch (const std::exception& e) {
@@ -322,8 +357,13 @@ mrb_value setup(mrb_state* mrb, void*) {
   // Native cached class pointers are not traced through mrb->ud. Keep it alive
   // even if user code removes or replaces AVS::Clip.
   mrb_gc_register(mrb, mrb_obj_value(clip));
+  auto* function = mrb_define_class_under(mrb, avs, "Function", mrb->object_class);
+  session(mrb).function_class = function;
+  mrb_gc_register(mrb, mrb_obj_value(function));
+  MRB_SET_INSTANCE_TT(function, MRB_TT_DATA);
   MRB_SET_INSTANCE_TT(clip, MRB_TT_DATA);
   const auto args = MRB_ARGS_ANY() | MRB_ARGS_KEY(0, 1) | MRB_ARGS_BLOCK();
+  mrb_define_method(mrb, function, "call", invoke, args);
   mrb_define_method(mrb, clip, "filter", invoke, args);
   mrb_define_method(mrb, clip, "method_missing", invoke, args);
   mrb_define_class_method(mrb, avs, "call", invoke, args);
@@ -521,7 +561,7 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
     *out = nullptr;
   if (!out || !host || host->revision != GARNET_CONTRACT_REVISION || host->size != sizeof(garnet_host) ||
       !host->identity || !host->invoke || !host->retain_clip || !host->release_clip || !host->register_filter ||
-      !host->get_var || !host->set_var)
+      !host->get_var || !host->set_var || !host->retain_function || !host->release_function || !host->invoke_function)
     return garnet::error("Invalid Garnet host contract", GARNET_INVALID_CONTRACT);
   try {
     auto s = std::make_unique<garnet_session>();

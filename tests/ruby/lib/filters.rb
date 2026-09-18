@@ -12,3 +12,4 @@ AVS.filter :GarnetResize,
 end
 factor = 2
 AVS.export(:GarnetTwice, 'i') { |x| AVS.Round(x * factor) }
+AVS.filter(:GarnetCall, args: {callback: :func, value: :int}) { |callback, value| callback.call(value) }

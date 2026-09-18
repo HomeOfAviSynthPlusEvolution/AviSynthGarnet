@@ -13,8 +13,17 @@ extern "C" {
 /* Private exact-match contract, not a stable public ABI. No exceptions may
  * cross it. Inputs are borrowed. Release results before destroying the host.
  * Destroy must not race with calls. Handles belong to exactly one host. */
-#define GARNET_CONTRACT_REVISION 3u
-enum { GARNET_UNDEFINED, GARNET_BOOL, GARNET_INT, GARNET_FLOAT, GARNET_STRING, GARNET_ARRAY, GARNET_CLIP };
+#define GARNET_CONTRACT_REVISION 4u
+enum {
+  GARNET_UNDEFINED,
+  GARNET_BOOL,
+  GARNET_INT,
+  GARNET_FLOAT,
+  GARNET_STRING,
+  GARNET_ARRAY,
+  GARNET_CLIP,
+  GARNET_FUNCTION
+};
 enum { GARNET_OK, GARNET_ERROR, GARNET_INVALID_CONTRACT, GARNET_BUSY };
 typedef struct garnet_string {
   const char* data;
@@ -63,6 +72,10 @@ typedef struct garnet_host {
   garnet_result(GARNET_CALL* get_var)(void* identity, void* call_context, garnet_string name);
   garnet_result(GARNET_CALL* set_var)(void* identity, void* call_context, garnet_string name, const garnet_value* value,
                                       int global);
+  garnet_result(GARNET_CALL* retain_function)(void* identity, void* handle);
+  void(GARNET_CALL* release_function)(void* identity, void* handle);
+  garnet_result(GARNET_CALL* invoke_function)(void* identity, void* call_context, void* handle,
+                                              const garnet_value* args, const garnet_string* names, size_t count);
 } garnet_host;
 #ifdef __cplusplus
 }
