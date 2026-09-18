@@ -84,7 +84,7 @@ AVSValue to_avs(Host& host, IScriptEnvironment* env, const garnet_value& v, int 
       return AVSValue(v.as.floating);
     case GARNET_STRING: {
       auto s = text(v.as.string);
-      if (s.find('\0') != std::string::npos || s.size() > INT_MAX)
+      if (s.find('\0') != std::string::npos || s.size() > (std::numeric_limits<int>::max)())
         throw std::runtime_error("AVS strings cannot contain NUL or exceed INT_MAX bytes");
       return AVSValue(env->SaveString(s.data(), static_cast<int>(s.size())));
     }

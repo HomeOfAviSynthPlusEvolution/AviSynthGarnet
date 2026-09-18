@@ -64,6 +64,8 @@ jobs:
           repository: AviSynth/AviSynthPlus
           ref: 5c82777b374bdef16e13007a11e77d735ac1e4eb
           path: build/upstream
+          # Upstream Version.cmake needs reachable tags and commit counts.
+          fetch-depth: 0
           submodules: recursive
           persist-credentials: false
 
