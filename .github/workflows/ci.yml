@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64 / MSVC
+            os: windows-2022
+            cc: cl
+            cxx: cl
+          - name: Windows x64 / clang-cl
+            os: windows-2022
+            cc: clang-cl
+            cxx: clang-cl
+          - name: Linux x64 / GCC
+            os: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+          - name: Linux ARM64 / Clang
+            os: ubuntu-24.04-arm
+            cc: clang
+            cxx: clang++
+          - name: macOS ARM64 / Apple Clang
+            os: macos-15
+            cc: clang
+            cxx: clang++
+          - name: macOS x64 / Apple Clang
+            os: macos-15-intel
+            cc: clang
+            cxx: clang++
+          - name: Linux x64 / Clang / ASan + UBSan
+            os: ubuntu-24.04
+            cc: clang
+            cxx: clang++
+            sanitize: true
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Use one upstream dev revision for both the public SDK and test runtime.
+      # Do not rely on a preinstalled AviSynth or third-party filter plugins.
+      - name: Checkout official AviSynth+
+        uses: actions/checkout@v6
+        with:
+          repository: AviSynth/AviSynthPlus
+          ref: 5c82777b374bdef16e13007a11e77d735ac1e4eb
+          path: build/upstream
+          submodules: recursive
+          persist-credentials: false
+
+      # This is the build-time interpreter; Garnet embeds its own pinned mruby.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang libclang-rt-dev bison gperf
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Build official AviSynth+ runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S build/upstream -B build/upstream-bin -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DENABLE_PLUGINS=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'AviSynth+ configure failed' }
+          cmake --build build/upstream-bin --target AvsCore --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'AviSynth+ build failed' }
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $runtime = (Resolve-Path build/upstream-bin/avs_core/AviSynth.dll).Path
+          cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} `
+            -DGARNET_BUILD_TESTS=ON -DGARNET_BUILD_PLUGIN=ON `
+            "-DGARNET_AVS_SDK_DIR=$env:GITHUB_WORKSPACE/build/upstream/avs_core/include" `
+            "-DGARNET_TEST_AVS_RUNTIME=$runtime"
+          if ($LASTEXITCODE -ne 0) { throw 'Garnet configure failed' }
+
+      - name: Configure (Linux and macOS)
+        if: runner.os != 'Windows'
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          GARNET_SANITIZE: ${{ matrix.sanitize || false }}
+        shell: bash
+        run: |
+          flags=()
+          if [[ "$GARNET_SANITIZE" == 'true' ]]; then
+            flags+=(
+              '-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer'
+              '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer'
+              '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined'
+              '-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined'
+            )
+          fi
+          cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DGARNET_BUILD_TESTS=ON -DGARNET_BUILD_PLUGIN=ON \
+            "-DGARNET_AVS_SDK_DIR=$GITHUB_WORKSPACE/build/upstream/avs_core/include" \
+            "${flags[@]}"
+
+      # minirake is restricted to one worker by Garnet's CMake driver.
+      - name: Build
+        run: cmake --build build/ci --parallel 4
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build/ci --output-on-failure --no-tests=error --parallel 4 --timeout 120
