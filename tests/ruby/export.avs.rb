@@ -1,4 +1,28 @@
 require_relative 'lib/filters'
+# Exercise real AVS closure creation/dispatch beyond the old cumulative limit.
+# The callback keeps a local reference to itself; no native owner is cached on
+# that Ruby object, so this does not pin each discarded function until close.
+def temporary_function(value)
+  fn = AVS.function(args: {x: :int}, returns: :int) { |x| x + 1 }
+  raise 'temporary function dispatch' unless fn.call(value) == value + 1
+end
+6000.times do |value|
+  temporary_function(value)
+  GC.start if value % 32 == 0
+end
+def shared_function
+  captured = [21]
+  fn = AVS.function(args: {x: :int}, returns: :int) { |x| captured[0] * x }
+  AVS[:first_copy] = fn
+  AVS[:second_copy] = fn
+  nil
+end
+shared_function
+AVS[:first_copy] = nil
+GC.start
+raise 'remaining native owner lost' unless AVS[:second_copy].call(2) == 42
+AVS[:second_copy] = nil
+GC.start
 [:function, :Function].each do |name|
   rejected = false
   begin

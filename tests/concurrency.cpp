@@ -139,7 +139,7 @@ garnet_result GARNET_CALL invoke_function(void*, void*, void*, const garnet_valu
   CHECK(false);
   return {};
 }
-garnet_result GARNET_CALL make_function(void*, void*, garnet_string, garnet_callback, void*) {
+garnet_result GARNET_CALL make_function(void*, void*, garnet_string, garnet_callback, void*, garnet_finalizer) {
   CHECK(false);
   return {};
 }

@@ -19,7 +19,7 @@ extern "C" {
  * Invoke, registration and variable operations can overlap across invocations;
  * their implementations must be thread-safe and may reenter via callbacks.
  * Retain runs under VM ownership: it must not wait for or invoke Ruby. */
-#define GARNET_CONTRACT_REVISION 7u
+#define GARNET_CONTRACT_REVISION 8u
 enum {
   GARNET_UNDEFINED,
   GARNET_BOOL,
@@ -56,11 +56,13 @@ typedef struct garnet_result {
   void* owner;
   void(GARNET_CALL* release)(void* owner);
 } garnet_result;
-/* A registered callback receives positional values in signature order, including
- * undefined placeholders for omitted optional arguments. It remains valid until
- * session destruction. The host must not call it during/after destruction. */
+/* A callback receives positional values in signature order, including undefined
+ * placeholders for omitted optional arguments. Named registered callbacks live
+ * until session destruction; function values use the make_function ownership
+ * contract below. The host must not call either during/after destruction. */
 typedef garnet_result(GARNET_CALL* garnet_callback)(void* data, void* call_context, const garnet_value* args,
                                                     size_t count);
+typedef void(GARNET_CALL* garnet_finalizer)(void* data);
 typedef struct garnet_host {
   uint32_t revision;
   uint32_t size;
@@ -82,9 +84,13 @@ typedef struct garnet_host {
   void(GARNET_CALL* release_function)(void* identity, void* handle);
   garnet_result(GARNET_CALL* invoke_function)(void* identity, void* call_context, void* handle,
                                               const garnet_value* args, const garnet_string* names, size_t count);
-  /* Creates a function value; callback lifetime matches registered filters. */
+  /* Takes ownership of data on entry, INCLUDING failure. Call release_data
+   * exactly once when the last native function reference (including in graphs)
+   * is gone, after all its callbacks finish. Copies share this ownership.
+   * release_data is non-throwing, thread-safe and never invokes Ruby; it may be
+   * called after session destruction, unlike the callback itself. */
   garnet_result(GARNET_CALL* make_function)(void* identity, void* call_context, garnet_string signature,
-                                            garnet_callback callback, void* data);
+                                            garnet_callback callback, void* data, garnet_finalizer release_data);
 } garnet_host;
 #ifdef __cplusplus
 }

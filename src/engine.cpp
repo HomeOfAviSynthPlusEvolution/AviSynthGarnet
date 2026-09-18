@@ -14,6 +14,7 @@
 #include <mruby/proc.h>
 #include <mruby/irep.h>
 #include <mruby/debug.h>
+#include <mruby/variable.h>
 #include <filesystem>
 #include <charconv>
 #include <fstream>
@@ -23,6 +24,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 static_assert(sizeof(mrb_int) == 8, "Garnet requires 64-bit mruby integers");
 static_assert(sizeof(mrb_float) == 8, "Garnet requires double precision mruby");
@@ -31,6 +33,32 @@ struct Export {
   mrb_value block;
   char returns = '.';
 };
+struct FunctionRoots;
+struct FunctionLease : Export {
+  mrb_value root = mrb_nil_value();
+  std::shared_ptr<FunctionRoots> roots;
+  FunctionLease* next = nullptr;
+};
+struct FunctionRoots {
+  std::mutex gate;
+  FunctionLease* retired = nullptr;
+  bool closed = false;
+};
+static void GARNET_CALL release_lease(void* data) noexcept {
+  auto* lease = static_cast<FunctionLease*>(static_cast<Export*>(data));
+  auto roots = lease->roots;
+  {
+    std::lock_guard<std::mutex> lock(roots->gate);
+    if (!roots->closed) {
+      lease->next = roots->retired;
+      roots->retired = lease;
+      return;
+    }
+  }
+  // The host can release captured AVS values after AtExit destroyed the VM.
+  // Only the detached control block is accessed here, never the dead session.
+  delete lease;
+}
 struct RetiredHandle {
   RetiredHandle* next = nullptr;
   virtual ~RetiredHandle() = default;
@@ -56,11 +84,27 @@ struct garnet_session {
   std::unordered_map<std::string, std::shared_ptr<ImportState>> loading;
   std::unordered_map<garnet::Invocation*, std::shared_ptr<ImportState>> import_waits;
   std::vector<std::unique_ptr<Export>> exports;
+  std::shared_ptr<FunctionRoots> function_roots = std::make_shared<FunctionRoots>();
   RetiredHandle* retired = nullptr;
   bool stopping = false;
   std::mutex release_gate;
   std::condition_variable release_ready;
   std::thread releaser;
+  void drain_function_roots(bool closing = false) {
+    FunctionLease* batch;
+    {
+      std::lock_guard<std::mutex> lock(function_roots->gate);
+      batch = std::exchange(function_roots->retired, nullptr);
+      function_roots->closed = closing;
+    }
+    while (batch) {
+      auto* next = batch->next;
+      if (!closing)
+        mrb_gc_unregister(ruby, batch->root);
+      delete batch;
+      batch = next;
+    }
+  }
   void retire(RetiredHandle* handle) noexcept {
     // Intrusive linking cannot allocate or call back into the host. The queue
     // mutex is never held during destruction or while acquiring VM ownership.
@@ -109,6 +153,7 @@ struct garnet_session {
       std::unique_lock<std::recursive_timed_mutex> lock(gate);
       poisoned = true;
       idle.wait(lock, [&] { return execution.calls.empty(); });
+      drain_function_roots(true);
       if (ruby) {
         mrb_close(ruby);
         ruby = nullptr;
@@ -157,6 +202,7 @@ auto host_call(garnet_session& s, Call&& call) {
     OutsideVM outside(*invocation);
     result->result.value = call(context);
   }
+  s.drain_function_roots();
   return result;
 }
 mrb_value load_file(mrb_state*, const std::string&, bool*, bool = true);
@@ -236,12 +282,47 @@ void free_function(mrb_state* mrb, void* p) {
   session(mrb).retire(static_cast<Function*>(p));
 }
 const mrb_data_type function_type{"AVS::Function", free_function};
+struct LocalFunction {
+  std::string signature;
+  char returns;
+};
+void free_local_function(mrb_state*, void* p) {
+  delete static_cast<LocalFunction*>(p);
+}
+const mrb_data_type local_function_type{"AVS::Function (Ruby)", free_local_function};
+garnet_result GARNET_CALL call_export(void*, void*, const garnet_value*, size_t);
+auto materialize_function(mrb_state* mrb, mrb_value value) {
+  auto& s = session(mrb);
+  auto* definition = static_cast<LocalFunction*>(DATA_PTR(value));
+  const auto block = mrb_iv_get(mrb, value, mrb_intern_lit(mrb, "@__garnet_body"));
+  if (!mrb_proc_p(block))
+    mrb_raise(mrb, E_TYPE_ERROR, "Invalid Ruby function body");
+  auto entry = std::make_unique<FunctionLease>();
+  entry->session = &s;
+  entry->block = block;
+  entry->returns = definition->returns;
+  entry->roots = s.function_roots;
+  // unregister removes ALL matching entries, not one reference. Give each
+  // native lease its own root so concurrent copies cannot unroot one another.
+  entry->root = mrb_ary_new_from_values(mrb, 1, &block);
+  mrb_gc_register(mrb, entry->root);
+  // Do not transfer ownership until the host call actually starts: detaching
+  // the VM or allocating its result owner can fail first.
+  std::unique_ptr<Export, decltype(&release_lease)> pending(entry.release(), release_lease);
+  return host_call(s, [&](void* context) {
+    return s.host.make_function(s.host.identity, context, span(definition->signature), call_export, pending.release(),
+                                release_lease);
+  });
+}
 
 void from_ruby(mrb_state* mrb, mrb_value value, Storage* out, int depth = 0) {
   if (depth > 32)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "Array nesting too deep or cyclic");
   if (mrb_nil_p(value))
     return;
+  // Materializing a local function hands off VM ownership. Keep even nested
+  // array/hash temporaries alive if another callback mutates their container.
+  mrb_gc_protect(mrb, value);
   if (mrb_true_p(value) || mrb_false_p(value)) {
     out->value.type = GARNET_BOOL;
     out->value.as.integer = mrb_true_p(value);
@@ -282,6 +363,14 @@ void from_ruby(mrb_state* mrb, mrb_value value, Storage* out, int depth = 0) {
     out->pin = s.host.retain_clip(s.host.identity, clip->retained.value.value.as.handle);
     if (out->pin.status != GARNET_OK)
       throw std::runtime_error(text(out->pin.error));
+    out->value = out->pin.value;
+  } else if (mrb_data_p(value) && DATA_TYPE(value) == &local_function_type && DATA_PTR(value)) {
+    auto owner = materialize_function(mrb, value);
+    out->pin = std::exchange(owner->result.value, garnet_result{});
+    if (out->pin.status != GARNET_OK)
+      throw std::runtime_error(text(out->pin.error));
+    if (out->pin.value.type != GARNET_FUNCTION || !out->pin.value.as.handle)
+      throw std::runtime_error("Host did not create a function");
     out->value = out->pin.value;
   } else if (mrb_data_p(value) && DATA_TYPE(value) == &function_type && DATA_PTR(value)) {
     auto& s = session(mrb);
@@ -380,7 +469,7 @@ bool identifier(const std::string& name) {
   }
   return true;
 }
-void validate_signature(const std::string& signature) {
+void validate_signature(const std::string& signature, bool function_value = false) {
   std::unordered_set<std::string> names;
   size_t count = 0;
   for (size_t i = 0; i < signature.size();) {
@@ -393,6 +482,8 @@ void validate_signature(const std::string& signature) {
       auto name = signature.substr(i, end - i);
       if (!identifier(name) || fold(name).find("__garnet_") == 0 || !names.insert(fold(name)).second)
         throw std::runtime_error("Invalid or duplicate exported parameter name");
+      if (function_value && fold(name) == "function")
+        throw std::runtime_error("Reserved AVS function parameter: function");
       i = end + 1;
     }
     if (i == signature.size() || std::string("cbifsn.").find(signature[i++]) == std::string::npos)
@@ -436,23 +527,16 @@ mrb_value make_function(mrb_state* mrb, mrb_value) {
     if (mrb_nil_p(block))
       throw std::runtime_error("AVS.function requires a block");
     const auto params = name_of(mrb, signature), output = name_of(mrb, returns);
-    validate_signature(params);
+    validate_signature(params, true);
     if (output.size() != 1 || std::string("cbifsn.").find(output[0]) == std::string::npos)
       throw std::runtime_error("Invalid function return type");
-    if (s.exports.size() >= 4096)
-      throw std::runtime_error("Too many exported functions");
-    auto entry = std::make_unique<Export>(Export{&s, block, output[0]});
-    mrb_gc_register(mrb, block);
-    auto* data = entry.get();
-    s.exports.push_back(std::move(entry));
-    auto owner = host_call(s, [&](void* context) {
-      return s.host.make_function(s.host.identity, context, span(params), call_export, data);
-    });
-    auto& r = owner->result;
-    r.check();
-    if (r.value.value.type != GARNET_FUNCTION)
-      throw std::runtime_error("Host did not create a function");
-    return to_ruby(mrb, r.value.value);
+    auto definition = std::make_unique<LocalFunction>(LocalFunction{params, output[0]});
+    auto object = mrb_obj_value(mrb_data_object_alloc(mrb, s.function_class, definition.get(), &local_function_type));
+    definition.release();
+    // Ruby traces this edge normally, including local variables containing the
+    // function itself. Never cache an owning native handle on this object.
+    mrb_iv_set(mrb, object, mrb_intern_lit(mrb, "@__garnet_body"), block);
+    return object;
   } catch (const std::exception& e) {
     mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
   }
@@ -462,7 +546,9 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
   mrb_int count;
   mrb_kwargs kwargs{0, 0, nullptr, nullptr, &keywords};
   mrb_get_args(mrb, "*:&", &values, &count, &kwargs, &block);
-  const bool function_call = mrb_data_p(self) && DATA_TYPE(self) == &function_type && DATA_PTR(self);
+  const bool local_function = mrb_data_p(self) && DATA_TYPE(self) == &local_function_type && DATA_PTR(self);
+  const bool function_call =
+      local_function || (mrb_data_p(self) && DATA_TYPE(self) == &function_type && DATA_PTR(self));
   if (!function_call && count < 1)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "Expected filter name");
   if (!mrb_nil_p(block))
@@ -503,10 +589,16 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
     std::vector<garnet_string> arg_names(positional);
     for (const auto& n : names)
       arg_names.push_back(span(n));
-    auto* function = function_call ? static_cast<Function*>(DATA_PTR(self)) : nullptr;
-    auto* handle = function ? function->retained.value.value.as.handle : nullptr;
+    std::unique_ptr<HostArguments, Retire> callable(nullptr, Retire{s});
+    void* handle = nullptr;
+    if (local_function) {
+      callable.reset(new HostArguments);
+      append_ruby(mrb, self, *callable);
+      handle = callable->values[0]->value.as.handle;
+    } else if (function_call)
+      handle = static_cast<Function*>(DATA_PTR(self))->retained.value.value.as.handle;
     auto owner = host_call(s, [&](void* context) {
-      return function
+      return function_call
                  ? s.host.invoke_function(s.host.identity, context, handle, args.data(), arg_names.data(), args.size())
                  : s.host.invoke(s.host.identity, context, span(name), args.data(), arg_names.data(), args.size());
     });
@@ -729,6 +821,7 @@ mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached, b
 }
 mrb_value evaluate_body(mrb_state* mrb, void* data) {
   try {
+    session(mrb).drain_function_roots();
     auto& e = *static_cast<Evaluation*>(data);
     auto value = e.file ? load_file(mrb, e.filename, nullptr, !e.pipeline) : execute_source(mrb, e.source, e.filename);
     if (!mrb->exc)
@@ -757,6 +850,7 @@ struct CallbackCall {
 };
 mrb_value callback_body(mrb_state* mrb, void* data) {
   try {
+    session(mrb).drain_function_roots();
     auto& call = *static_cast<CallbackCall*>(data);
     std::vector<mrb_value> args;
     for (size_t i = 0; i < call.count; ++i)

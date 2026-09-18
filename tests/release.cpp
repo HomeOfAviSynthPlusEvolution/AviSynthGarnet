@@ -29,13 +29,13 @@ struct Host {
   garnet_session* session = nullptr;
   garnet_callback callback = nullptr;
   void* data = nullptr;
-  garnet_callback function_callback = nullptr;
-  void* function_data = nullptr;
   std::thread::id entry_thread = std::this_thread::get_id();
   bool check_release_thread = false;
   std::atomic<bool> allow_failed_entry{false};
   std::atomic<int> live{0}, released{0}, reentries{0};
+  std::atomic<int> functions_created{0}, functions_finalized{0};
   std::atomic<bool> reenter{true};
+  bool fail_function = false;
   std::mutex events;
   std::condition_variable event;
   void wait_for_reentries(int count) {
@@ -43,11 +43,22 @@ struct Host {
     CHECK(event.wait_for(lock, std::chrono::seconds(10), [&] { return reentries == count; }));
     CHECK(live == 0);
   }
+  void wait_for_functions(int count) {
+    std::unique_lock<std::mutex> lock(events);
+    CHECK(event.wait_for(lock, std::chrono::seconds(10), [&] { return functions_finalized == count; }));
+  }
+  void wait_for_empty() {
+    std::unique_lock<std::mutex> lock(events);
+    CHECK(event.wait_for(lock, std::chrono::seconds(10), [&] { return live == 0; }));
+  }
 };
 struct Handle {
   Host& host;
   uint32_t type;
   std::atomic<int> references{1};
+  garnet_callback callback = nullptr;
+  void* data = nullptr;
+  garnet_finalizer finalize = nullptr;
 };
 void GARNET_CALL release_handle(void* pointer) {
   auto* handle = static_cast<Handle*>(pointer);
@@ -59,7 +70,17 @@ void GARNET_CALL release_handle(void* pointer) {
   auto& host = handle->host;
   --host.live;
   ++host.released;
+  if (handle->finalize) {
+    handle->finalize(handle->data);
+    ++host.functions_finalized;
+  }
   delete handle;
+  // Publish completion under the condition-variable mutex, including releases
+  // that do not perform the destructor-reentry exercise below.
+  {
+    std::lock_guard<std::mutex> lock(host.events);
+  }
+  host.event.notify_all();
   if (host.reenter) {
     // Model a filter destructor that joins a frame worker. The worker must be
     // able to enter Ruby and collect again, not time out waiting for the VM.
@@ -124,23 +145,40 @@ garnet_result GARNET_CALL set(void*, void*, garnet_string, const garnet_value*, 
   CHECK(false);
   return {};
 }
-garnet_result GARNET_CALL invoke_function(void*, void*, void*, const garnet_value*, const garnet_string*, size_t) {
-  CHECK(false);
-  return {};
+garnet_result GARNET_CALL invoke_function(void*, void* context, void* pointer, const garnet_value* args,
+                                          const garnet_string*, size_t count) {
+  auto* handle = static_cast<Handle*>(pointer);
+  CHECK(handle->callback);
+  return handle->callback(handle->data, context, args, count);
 }
-garnet_result GARNET_CALL make_function(void* identity, void*, garnet_string, garnet_callback callback, void* data) {
+garnet_result GARNET_CALL make_function(void* identity, void*, garnet_string, garnet_callback callback, void* data,
+                                        garnet_finalizer release_data) {
   auto& host = *static_cast<Host*>(identity);
-  host.function_callback = callback;
-  host.function_data = data;
+  ++host.functions_created;
+  if (host.fail_function) {
+    release_data(data);
+    ++host.functions_finalized;
+    garnet_result r{};
+    r.status = GARNET_ERROR;
+    r.error = str("deliberate make failure");
+    return r;
+  }
   ++host.live;
-  return owned(new Handle{host, GARNET_FUNCTION});
+  auto* handle = new Handle{host, GARNET_FUNCTION};
+  handle->callback = callback;
+  handle->data = data;
+  handle->finalize = release_data;
+  return owned(handle);
 }
-void eval(Host& host, const char* source, bool success = true) {
+garnet_result evaluate(Host& host, const char* source, bool success = true) {
   auto r = garnet_evaluate(host.session, &host, str(source), str("release.avs.rb"));
   if (success && r.status != GARNET_OK)
     std::fprintf(stderr, "%.*s\n", static_cast<int>(r.error.size), r.error.data);
   CHECK((r.status == GARNET_OK) == success);
-  release(r);
+  return r;
+}
+void eval(Host& host, const char* source, bool success = true) {
+  release(evaluate(host, source, success));
 }
 void create(Host& host) {
   garnet_host api{GARNET_CONTRACT_REVISION,
@@ -160,6 +198,88 @@ void create(Host& host) {
   CHECK(r.status == GARNET_OK);
   release(r);
   eval(host, "AVS.export('Reenter', '') { GC.start; 42 }; nil");
+}
+void function_lifetimes() {
+  {
+    Host host;
+    host.reenter = false;
+    create(host);
+    // f is also in its block's local environment. Pure Ruby tracing must be
+    // able to collect this self-reference when no native owner remains.
+    eval(host, "def owned_function; clip = AVS.Source; f = AVS.function(returns: :clip) { clip }; f; end; "
+               "$f = owned_function; nil");
+    CHECK(host.live == 1 && host.functions_created == 0);
+    auto first = evaluate(host, "$f");
+    auto second = evaluate(host, "$f");
+    CHECK(first.value.type == GARNET_FUNCTION && second.value.type == GARNET_FUNCTION);
+    CHECK(host.live == 3 && host.functions_created == 2);
+    eval(host, "$f = nil; GC.start; nil");
+    release(first);
+    host.wait_for_functions(1);
+    // Both native instances use the SAME Ruby block. Retiring the first root
+    // must not unroot the second one (mruby unregister removes all matches).
+    eval(host, "GC.start; nil");
+    CHECK(host.live == 2);
+    auto copy = retain(&host, second.value.as.handle);
+    release(second);
+    auto output = invoke_function(&host, &host, copy.value.as.handle, nullptr, nullptr, 0);
+    CHECK(output.status == GARNET_OK && output.value.type == GARNET_CLIP);
+    release(output);
+    release(copy);
+    host.wait_for_functions(2);
+    eval(host, "GC.start; nil");
+    host.wait_for_empty();
+    CHECK(host.released == 3);
+    garnet_destroy(host.session);
+  }
+  {
+    Host host;
+    host.reenter = false;
+    create(host);
+    eval(host, "def temporary_function(n); clip = AVS.Source; "
+               "f = AVS.function(args: {value: :int}, returns: :int) { |value| "
+               "raise unless clip.is_a?(AVS::Clip); value + 1 }; "
+               "raise unless f.call(n) == n + 1; nil; end; "
+               "6000.times { |n| temporary_function(n); GC.start if n % 32 == 0 }; nil");
+    host.wait_for_functions(6000);
+    eval(host, "GC.start; nil");
+    host.wait_for_empty();
+    CHECK(host.functions_created == 6000 && host.released == 12000);
+    garnet_destroy(host.session);
+  }
+  {
+    Host host;
+    host.reenter = false;
+    host.fail_function = true;
+    create(host);
+    eval(host, "def failed_function; clip = AVS.Source; f = AVS.function { clip }; "
+               "begin; f.call; raise 'missing failure'; rescue => e; "
+               "raise unless e.message.include?('deliberate make failure'); end; nil; end; "
+               "failed_function; nil");
+    eval(host, "GC.start; nil");
+    host.wait_for_empty();
+    CHECK(host.functions_created == 1 && host.functions_finalized == 1);
+    garnet_destroy(host.session);
+  }
+  {
+    Host host;
+    host.reenter = false;
+    create(host);
+    auto output = evaluate(host, "clip = AVS.Source; AVS.function { clip }");
+    CHECK(output.value.type == GARNET_FUNCTION);
+    auto first = retain(&host, output.value.as.handle);
+    auto second = retain(&host, output.value.as.handle);
+    release(output);
+    // Model AVS globals releasing captured values AFTER AtExit destroys Ruby.
+    // No callback is permitted now, but the lease finalizer must remain safe.
+    garnet_destroy(host.session);
+    CHECK(host.live == 1 && host.functions_finalized == 0);
+    std::thread a([&] { release(first); });
+    std::thread b([&] { release(second); });
+    a.join();
+    b.join();
+    CHECK(host.live == 0 && host.functions_finalized == 1 && host.released == 2);
+  }
 }
 } // namespace
 
@@ -195,17 +315,10 @@ int main() {
     Host mismatch;
     mismatch.check_release_thread = true;
     create(mismatch);
-    eval(mismatch, "$fn = AVS.function(returns: :int) { AVS.Source }; nil");
-    auto r = mismatch.function_callback(mismatch.function_data, &mismatch, nullptr, 0);
-    CHECK(r.status == GARNET_ERROR);
-    CHECK(std::string_view(r.error.data, r.error.size).find("return type mismatch") != std::string_view::npos);
-    release(r);
-    eval(mismatch, "GC.start; 42"); // Return validation failure is recoverable.
-    {
-      std::unique_lock<std::mutex> lock(mismatch.events);
-      CHECK(mismatch.event.wait_for(lock, std::chrono::seconds(10), [&] { return mismatch.reentries == 1; }));
-    }
-    CHECK(mismatch.live == 1); // The function is still rooted by $fn.
+    eval(mismatch, "$fn = AVS.function(returns: :int) { AVS.Source }; "
+                   "begin; $fn.call; raise 'missing mismatch'; rescue => e; "
+                   "raise unless e.message.include?('return type mismatch'); end; GC.start; 42");
+    mismatch.wait_for_reentries(2); // No native handle is cached on $fn.
     mismatch.reenter = false;
     garnet_destroy(mismatch.session);
     CHECK(mismatch.live == 0 && mismatch.released == 2);
@@ -220,6 +333,7 @@ int main() {
     garnet_destroy(partial.session);
     CHECK(partial.live == 0 && partial.released == 1);
   }
-  std::puts("PASS deferred clip/function release, cross-thread destructor reentry, nesting, failure and close");
+  function_lifetimes();
+  std::puts("PASS deferred release, reentry, 6000 temporary functions, shared roots, failure and late finalization");
   return 0;
 }

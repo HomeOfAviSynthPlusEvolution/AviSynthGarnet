@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <limits>
 #include <unordered_set>
+#include <unordered_map>
 #include <mutex>
 
 const AVS_Linkage* AVS_linkage = nullptr;
@@ -30,7 +31,7 @@ struct Host {
   std::vector<std::unique_ptr<Export>> exports;
   std::mutex exports_gate;
   std::unordered_set<std::string> export_names;
-  std::vector<std::unique_ptr<Export>> functions;
+  std::unordered_map<std::string, AVSValue> function_factories;
   std::mutex functions_gate;
   ~Host() { garnet_destroy(session); }
 };
@@ -346,20 +347,40 @@ garnet_result GARNET_CALL register_filter(void* identity, void* context, garnet_
     return error("Unknown filter registration failure");
   }
 }
-AVSValue __cdecl dispatch_function(AVSValue args, void* data, IScriptEnvironment* env) {
-  auto& host = *static_cast<Host*>(data);
-  const auto token = args[0].AsLong();
-  Export* entry = nullptr;
-  {
-    // Lookups occur before entering the VM; another callback may append a
-    // function and reallocate the vector. Never hold this lock across Ruby.
-    std::lock_guard<std::mutex> lock(host.functions_gate);
-    if (token >= 1 && static_cast<uint64_t>(token) <= host.functions.size())
-      entry = host.functions[static_cast<size_t>(token - 1)].get();
+struct CallbackOwner {
+  void* data;
+  garnet_finalizer release;
+  ~CallbackOwner() {
+    if (release)
+      release(data);
   }
-  if (!entry || !args[1].IsArray())
+};
+// Public IClip ownership lets a real AVS closure keep its callback alive. No
+// private IFunction layout or session-lifetime integer registry is required.
+struct FunctionToken : IClip {
+  Export entry;
+  garnet_finalizer release;
+  VideoInfo info{};
+  FunctionToken(Host& host, garnet_callback callback, void* data, garnet_finalizer release)
+      : entry{&host, callback, data}, release(release) {}
+  ~FunctionToken() override { release(entry.data); }
+  PVideoFrame __stdcall GetFrame(int, IScriptEnvironment* env) override {
+    env->ThrowError("Garnet function token is not video");
+    return {};
+  }
+  bool __stdcall GetParity(int) override { return false; }
+  void __stdcall GetAudio(void*, int64_t, int64_t, IScriptEnvironment* env) override {
+    env->ThrowError("Garnet function token is not audio");
+  }
+  int __stdcall SetCacheHints(int, int) override { return 0; }
+  const VideoInfo& __stdcall GetVideoInfo() override { return info; }
+};
+AVSValue __cdecl dispatch_function(AVSValue args, void* data, IScriptEnvironment* env) {
+  const auto owner = args[0].AsClip();
+  auto* token = dynamic_cast<FunctionToken*>(owner.operator->());
+  if (!token || token->entry.host != data || !args[1].IsArray())
     env->ThrowError("Garnet: invalid function dispatch");
-  return exported_filter(args[1], entry, env);
+  return exported_filter(args[1], &token->entry, env);
 }
 std::string function_source(const std::string& signature) {
   std::string params, values;
@@ -427,28 +448,41 @@ std::string function_source(const std::string& signature) {
     params += std::string(type) + " " + (optional ? "\"" + name + "\"" : name);
     values += name;
   }
-  return "function [__garnet_token](" + params + ") { return __GarnetDispatch(__garnet_token, args=[" + values + "]) }";
+  // Cache only the factory/AST, not returned closures or callback owners.
+  return "function(clip __garnet_owner) { return function [__garnet_owner](" + params +
+         ") { return __GarnetDispatch(__garnet_owner, args=[" + values + "]) } }";
 }
 garnet_result GARNET_CALL make_function(void* identity, void* context, garnet_string signature,
-                                        garnet_callback callback, void* data) {
+                                        garnet_callback callback, void* data, garnet_finalizer release_data) {
+  CallbackOwner lease{data, release_data};
   try {
     auto& host = *static_cast<Host*>(identity);
     auto* env = static_cast<IScriptEnvironment*>(context);
-    if (!env || !callback)
+    if (!env || !callback || !release_data)
       return error("Cannot create Garnet function");
-    const auto source = function_source(text(signature));
-    auto entry = std::make_unique<Export>(Export{&host, callback, data});
-    size_t token;
+    const auto params = text(signature);
+    AVSValue factory;
     {
       std::lock_guard<std::mutex> lock(host.functions_gate);
-      if (host.functions.size() >= 4096)
-        return error("Cannot create Garnet function");
-      host.functions.push_back(std::move(entry));
-      token = host.functions.size();
+      const auto found = host.function_factories.find(params);
+      if (found != host.function_factories.end())
+        factory = found->second;
     }
+    if (!factory.Defined()) {
+      const auto source = function_source(params);
+      // Eval can trigger autoload/reentry: never hold the registry mutex here.
+      factory = env->Invoke("Eval", AVSValue(source.c_str()));
+      if (!factory.IsFunction())
+        return error("AVS did not create a function factory");
+      std::lock_guard<std::mutex> lock(host.functions_gate);
+      factory = host.function_factories.emplace(params, factory).first->second;
+    }
+    auto token = std::make_unique<FunctionToken>(host, callback, data, release_data);
+    lease.release = nullptr;
+    PClip owner(token.release());
     LocalContext local(env);
-    env->SetVar("__garnet_token", AVSValue(static_cast<int64_t>(token)));
-    const auto value = env->Invoke("Eval", AVSValue(source.c_str()));
+    env->SetVar("__garnet_factory", factory);
+    const auto value = env->Invoke("__garnet_factory", AVSValue(owner));
     if (!value.IsFunction())
       return error("AVS did not create a function value");
     return result(from_avs(host, value));
@@ -566,7 +600,7 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
     auto* owned = host.release();
     env->AddFunction("ImportRuby", "s", import_ruby, owned);
     env->AddFunction("ImportScript", "cs", import_script, owned);
-    env->AddFunction("__GarnetDispatch", "i[args].", dispatch_function, owned);
+    env->AddFunction("__GarnetDispatch", "c[args].", dispatch_function, owned);
     return "Garnet Ruby binding";
   } catch (const std::exception& e) {
     env->ThrowError("Garnet initialization: %s", e.what());

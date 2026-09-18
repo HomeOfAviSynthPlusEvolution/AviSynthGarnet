@@ -5,13 +5,13 @@
 #ifdef _WIN32
 #include <windows.h>
 typedef volatile LONG clip_count;
-static void add_clips(clip_count* count, int change) {
-  InterlockedExchangeAdd(count, change);
+static int add_clips(clip_count* count, int change) {
+  return InterlockedExchangeAdd(count, change) + change;
 }
 #else
 typedef int clip_count;
-static void add_clips(clip_count* count, int change) {
-  __atomic_fetch_add(count, change, __ATOMIC_RELAXED);
+static int add_clips(clip_count* count, int change) {
+  return __atomic_add_fetch(count, change, __ATOMIC_ACQ_REL);
 }
 #endif
 
@@ -31,10 +31,16 @@ typedef struct fake_host {
   void* callback_data;
   garnet_value variable;
 } fake_host;
+typedef struct fake_lease {
+  clip_count refs;
+  garnet_finalizer release;
+  void* data;
+} fake_lease;
 typedef struct fake_clip {
   fake_host* host;
   garnet_callback callback;
   void* callback_data;
+  fake_lease* lease;
 } fake_clip;
 static garnet_string str(const char* s) {
   garnet_string v = {s, strlen(s)};
@@ -46,6 +52,11 @@ static void release_result(garnet_result r) {
 }
 static void GARNET_CALL free_clip(void* identity, void* p) {
   fake_host* host = (fake_host*)identity;
+  fake_lease* lease = ((fake_clip*)p)->lease;
+  if (lease && add_clips(&lease->refs, -1) == 0) {
+    lease->release(lease->data);
+    free(lease);
+  }
   add_clips(&host->clips, -1);
   free(p);
 }
@@ -60,6 +71,7 @@ static garnet_result clip_result(fake_host* host) {
   clip->host = host;
   clip->callback = NULL;
   clip->callback_data = NULL;
+  clip->lease = NULL;
   add_clips(&host->clips, 1);
   r.value.type = GARNET_CLIP;
   r.value.as.handle = clip;
@@ -72,6 +84,8 @@ static garnet_result GARNET_CALL retain(void* identity, void* handle) {
   CHECK(((fake_clip*)handle)->host == identity);
   r = clip_result((fake_host*)identity);
   *(fake_clip*)r.value.as.handle = *(fake_clip*)handle;
+  if (((fake_clip*)handle)->lease)
+    add_clips(&((fake_clip*)handle)->lease->refs, 1);
   return r;
 }
 static int equal(garnet_string a, const char* b) {
@@ -165,13 +179,18 @@ static garnet_result GARNET_CALL invoke_function(void* identity, void* context, 
   return r;
 }
 static garnet_result GARNET_CALL make_function(void* identity, void* context, garnet_string signature,
-                                               garnet_callback callback, void* data) {
+                                               garnet_callback callback, void* data, garnet_finalizer release_data) {
   fake_host* host = (fake_host*)identity;
   garnet_result r = clip_result(host);
   CHECK(context == &host->context && equal(signature, "i"));
   r.value.type = GARNET_FUNCTION;
   ((fake_clip*)r.value.as.handle)->callback = callback;
   ((fake_clip*)r.value.as.handle)->callback_data = data;
+  ((fake_clip*)r.value.as.handle)->lease = (fake_lease*)malloc(sizeof(fake_lease));
+  CHECK(((fake_clip*)r.value.as.handle)->lease);
+  ((fake_clip*)r.value.as.handle)->lease->refs = 1;
+  ((fake_clip*)r.value.as.handle)->lease->release = release_data;
+  ((fake_clip*)r.value.as.handle)->lease->data = data;
   return r;
 }
 static garnet_host api(fake_host* host) {
