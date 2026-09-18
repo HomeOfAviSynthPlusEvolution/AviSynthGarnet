@@ -8,7 +8,9 @@ typedef struct garnet_session garnet_session;
 /* On failure *out is null. Table is copied; identity remains borrowed. */
 garnet_result GARNET_CALL garnet_create(const garnet_host* host, garnet_session** out);
 /* Returns the last expression. Fresh parser locals, shared VM/constants.
- * Failed evaluation disables the session. These evaluation entrypoints reject
+ * Failed evaluation/initialization disables the session; ordinary registered
+ * callback exceptions do not, and may be rescued by an outer Ruby callback.
+ * These evaluation entrypoints reject
  * concurrent/reentrant evaluation; file imports allow bounded same-thread
  * nesting. Registered callbacks serialize Ruby execution, but host calls hand
  * off VM ownership while remaining on the original calling thread. Callbacks

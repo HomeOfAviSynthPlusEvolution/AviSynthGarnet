@@ -69,6 +69,8 @@ garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string na
     auto r = call(host, 0);
     CHECK(r.status == GARNET_OK);
     release(r);
+  } else if (filter == "NestedFailure") {
+    return call(host, 6);
   } else if (filter == "Failure") {
     garnet_result r{};
     r.status = GARNET_ERROR;
@@ -191,6 +193,17 @@ AVS.export('Count', 'i') do |mode|
     GC.start
     raise 'call context changed' unless AVS[:local] == mode
     next 42
+  elsif mode == 6
+    raise 'ordinary callback failure'
+  elsif mode == 7
+    begin
+      AVS.NestedFailure
+      raise 'missing nested exception'
+    rescue => e
+      raise 'wrong nested error' unless e.message.include?('ordinary callback failure')
+    end
+    GC.start
+    next 42
   elsif mode == 4 || mode == 5
     # A and B both park, then A exits and frees its arena BEFORE B resumes.
     a = Array.new(3) { |i| "#{mode}-#{i}" }
@@ -232,6 +245,11 @@ nil
   check(call(host, 2), 102);
   check(call(host, 0), 103);
   check(call(host, 3), 42);
+  check(call(host, 7), 42);
+  r = call(host, 6);
+  CHECK(r.status == GARNET_ERROR);
+  release(r);
+  check(call(host, 7), 42);
   std::thread a([&] { check(call(host, 4), 4); });
   {
     std::unique_lock<std::mutex> lock(host.events);
@@ -242,6 +260,9 @@ nil
   // Evaluation must be rejected even when the VM is temporarily idle.
   r = garnet_evaluate(host.session, &context, str("42"), str("busy.rb"));
   CHECK(r.status == GARNET_BUSY);
+  release(r);
+  r = call(host, 6); // Failure in A must not poison B's parked invocation.
+  CHECK(r.status == GARNET_ERROR);
   release(r);
   r = call(host, 0); // GC while B owns a suspended invocation's arena.
   CHECK(r.status == GARNET_OK);

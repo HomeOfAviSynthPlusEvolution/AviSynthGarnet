@@ -194,13 +194,18 @@ int main() {
   {
     Host mismatch;
     mismatch.check_release_thread = true;
-    mismatch.allow_failed_entry = true;
     create(mismatch);
     eval(mismatch, "$fn = AVS.function(returns: :int) { AVS.Source }; nil");
     auto r = mismatch.function_callback(mismatch.function_data, &mismatch, nullptr, 0);
     CHECK(r.status == GARNET_ERROR);
     CHECK(std::string_view(r.error.data, r.error.size).find("return type mismatch") != std::string_view::npos);
     release(r);
+    eval(mismatch, "GC.start; 42"); // Return validation failure is recoverable.
+    {
+      std::unique_lock<std::mutex> lock(mismatch.events);
+      CHECK(mismatch.event.wait_for(lock, std::chrono::seconds(10), [&] { return mismatch.reentries == 1; }));
+    }
+    CHECK(mismatch.live == 1); // The function is still rooted by $fn.
     mismatch.reenter = false;
     garnet_destroy(mismatch.session);
     CHECK(mismatch.live == 0 && mismatch.released == 2);

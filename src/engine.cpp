@@ -753,7 +753,7 @@ garnet_result GARNET_CALL call_export(void* data, void* context, const garnet_va
     // ownership, so another worker can satisfy a synchronous frame dependency.
     if (!lock.try_lock_for(std::chrono::seconds(5)))
       return error("Ruby callback wait exceeded 5 seconds (contention or cross-thread dependency)", GARNET_BUSY);
-    if (s.poisoned)
+    if (s.poisoned || s.import_failed)
       return error("Ruby session disabled after failed evaluation");
     if (count > 32767 || (count && !args))
       return error("Invalid callback arguments");
@@ -765,11 +765,14 @@ garnet_result GARNET_CALL call_export(void* data, void* context, const garnet_va
     CallbackCall call{entry, args, count, {new HostArguments, Retire{s}}};
     mrb_bool failed = false;
     auto value = mrb_protect_error(s.ruby, callback_body, &call, &failed);
+    // The protected boundary has unwound this invocation. An ordinary callback
+    // exception is a result, not corruption of the shared VM. Keep fail-closed
+    // behavior for initialization failures and incomplete native unwinding.
+    active.done = true;
     check_ruby(s.ruby, failed, value);
     if (s.poisoned || s.import_failed)
       throw std::runtime_error("Ruby session disabled after nested failure");
     auto out = result(std::move(call.output->values[0]));
-    active.done = true;
     return out;
   } catch (const std::exception& e) {
     return error(e.what());
