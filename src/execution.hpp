@@ -4,6 +4,7 @@
 #include <mruby/proc.h>
 #include <mruby/version.h>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <mutex>
@@ -44,6 +45,42 @@ struct Execution {
   ExecutionState idle;
   std::vector<Invocation*> calls;
   Invocation* current = nullptr;
+  // Keep ordinary callback buffers, not a session's worst-ever Ruby stack.
+  std::array<ExecutionState, 8> pool{};
+  size_t pooled = 0;
+  void recycle(ExecutionState state) noexcept {
+    auto* c = state.context;
+    if (pooled == pool.size() || c->stend - c->stbase > 4096 || c->ciend - c->cibase > 256 || state.capacity > 4096) {
+      mrb_free(ruby, state.arena);
+      mrb_free_context(ruby, c);
+      return;
+    }
+    // Pooled contexts are not GC roots. No stale object, exception, environment
+    // or native jump target may be observed when this slot is reused.
+    std::fill(c->stbase, c->stend, mrb_nil_value());
+    std::memset(c->cibase, 0, sizeof(mrb_callinfo) * (c->ciend - c->cibase));
+    c->prev = nullptr;
+    c->ci = c->cibase;
+    c->ci->stack = c->stbase;
+    c->ci->u.target_class = ruby->object_class;
+    c->ci->vis = MRB_METHOD_PUBLIC_FL;
+    c->status = MRB_FIBER_RUNNING;
+    c->vmexec = false;
+    c->fib = nullptr;
+    state.jump = nullptr;
+    state.exception = nullptr;
+    state.size = 0;
+    pool[pooled++] = state;
+  }
+  // Call while mruby is still alive and no invocation is active.
+  void clear() noexcept {
+    assert(calls.empty() && !current);
+    while (pooled) {
+      const auto state = pool[--pooled];
+      mrb_free(ruby, state.arena);
+      mrb_free_context(ruby, state.context);
+    }
+  }
   void chain() noexcept;
 };
 
@@ -79,25 +116,28 @@ struct Invocation {
       std::memset(p, 0, bytes);
       return p;
     };
-    try {
-      state.context = static_cast<mrb_context*>(allocate(sizeof(mrb_context)));
-      auto* c = state.context;
-      c->stbase = static_cast<mrb_value*>(allocate(128 * sizeof(mrb_value)));
-      c->stend = c->stbase + 128;
-      std::fill(c->stbase, c->stend, mrb_nil_value());
-      c->cibase = static_cast<mrb_callinfo*>(allocate(32 * sizeof(mrb_callinfo)));
-      c->ci = c->cibase;
-      c->ciend = c->cibase + 32;
-      c->ci->stack = c->stbase;
-      c->ci->u.target_class = m->object_class;
-      c->ci->vis = MRB_METHOD_PUBLIC_FL;
-      c->status = MRB_FIBER_RUNNING;
-      state.arena = static_cast<RBasic**>(allocate(MRB_GC_ARENA_SIZE * sizeof(RBasic*)));
-      state.capacity = MRB_GC_ARENA_SIZE;
-    } catch (...) {
-      mrb_free_context(m, state.context);
-      throw;
-    }
+    if (vm.pooled) {
+      state = vm.pool[--vm.pooled];
+    } else
+      try {
+        state.context = static_cast<mrb_context*>(allocate(sizeof(mrb_context)));
+        auto* c = state.context;
+        c->stbase = static_cast<mrb_value*>(allocate(128 * sizeof(mrb_value)));
+        c->stend = c->stbase + 128;
+        std::fill(c->stbase, c->stend, mrb_nil_value());
+        c->cibase = static_cast<mrb_callinfo*>(allocate(32 * sizeof(mrb_callinfo)));
+        c->ci = c->cibase;
+        c->ciend = c->cibase + 32;
+        c->ci->stack = c->stbase;
+        c->ci->u.target_class = m->object_class;
+        c->ci->vis = MRB_METHOD_PUBLIC_FL;
+        c->status = MRB_FIBER_RUNNING;
+        state.arena = static_cast<RBasic**>(allocate(MRB_GC_ARENA_SIZE * sizeof(RBasic*)));
+        state.capacity = MRB_GC_ARENA_SIZE;
+      } catch (...) {
+        mrb_free_context(m, state.context);
+        throw;
+      }
     vm.idle = ExecutionState::save(m);
     vm.calls.push_back(this);
     state.install(m);
@@ -112,13 +152,19 @@ struct Invocation {
     const int count = m->gc.arena_idx;
     // Arena entries include temporaries held only on C stacks (sort, Hash
     // default blocks, etc.). Stack scanning alone cannot keep those alive.
-    auto keep = mrb_ary_new_capa(m, static_cast<mrb_int>(count) + 1);
+    // One private root container per invocation, reused across host calls.
+    // It stays registered while empty too; another invocation can collect.
+    if (mrb_nil_p(roots)) {
+      const auto keep = mrb_ary_new_capa(m, static_cast<mrb_int>(count) + 1);
+      mrb_gc_register(m, keep);
+      roots = keep;
+    }
+    // A rescued allocation failure may have left an incomplete prior snapshot.
+    mrb_ary_resize(m, roots, 0);
     for (int i = 0; i < count; ++i)
-      mrb_ary_push(m, keep, mrb_obj_value(m->gc.arena[i]));
+      mrb_ary_push(m, roots, mrb_obj_value(m->gc.arena[i]));
     if (m->exc)
-      mrb_ary_push(m, keep, mrb_obj_value(m->exc));
-    mrb_gc_register(m, keep);
-    roots = keep;
+      mrb_ary_push(m, roots, mrb_obj_value(m->exc));
     mrb_gc_arena_restore(m, count);
     state = ExecutionState::save(m);
     vm.idle.install(m);
@@ -134,8 +180,7 @@ struct Invocation {
     state.install(vm.ruby);
     vm.current = this;
     vm.chain();
-    mrb_gc_unregister(vm.ruby, roots);
-    roots = mrb_nil_value();
+    mrb_ary_resize(vm.ruby, roots, 0);
   }
   ~Invocation() {
     assert(vm.current == this && lock.owns_lock() && caller == this);
@@ -145,14 +190,15 @@ struct Invocation {
     auto* env = mrb_vm_ci_env(m->c->ci);
     if (env && MRB_ENV_ONSTACK_P(env))
       mrb_env_unshare(m, env, true); // Never throw from stack cleanup.
+    if (!mrb_nil_p(roots))
+      mrb_gc_unregister(m, roots);
     state = ExecutionState::save(m);
     vm.idle.install(m);
     vm.current = nullptr;
     caller = previous;
     vm.calls.erase(std::find(vm.calls.begin(), vm.calls.end(), this));
     vm.chain();
-    mrb_free(m, state.arena);
-    mrb_free_context(m, state.context);
+    vm.recycle(state);
   }
 };
 inline void Execution::chain() noexcept {

@@ -155,6 +155,7 @@ struct garnet_session {
       idle.wait(lock, [&] { return execution.calls.empty(); });
       drain_function_roots(true);
       if (ruby) {
+        execution.clear();
         mrb_close(ruby);
         ruby = nullptr;
       }
