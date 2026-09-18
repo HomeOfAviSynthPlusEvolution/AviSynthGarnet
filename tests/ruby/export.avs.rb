@@ -1,4 +1,14 @@
 require_relative 'lib/filters'
+[:function, :Function].each do |name|
+  rejected = false
+  begin
+    AVS.function(options: {name => :int}) { |**values| values[name] }
+  rescue RuntimeError => error
+    raise unless error.to_s.include?('Reserved AVS function parameter')
+    rejected = true
+  end
+  raise 'Reserved function parameter accepted' unless rejected
+end
 factor = 2
 rubyfn = AVS.function(args: {x: :int}, options: {offset: :int}, returns: :int) do |x, offset: 0|
   x * factor + offset

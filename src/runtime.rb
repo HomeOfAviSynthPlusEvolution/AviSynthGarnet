@@ -40,6 +40,12 @@ module AVS
       schema.each do |key, type|
         text = key.to_s
         canonical = text.downcase
+        valid = !text.empty? && canonical[0, 9] != '__garnet_'
+        text.bytes.each_with_index do |byte, index|
+          valid &&= byte == 95 || (byte >= 65 && byte <= 90) ||
+                    (byte >= 97 && byte <= 122) || (index > 0 && byte >= 48 && byte <= 57)
+        end
+        raise ArgumentError, "invalid parameter name #{text}" unless valid
         raise ArgumentError, "duplicate parameter #{text}" if seen[canonical]
         seen[canonical] = true
         code = __type(type)

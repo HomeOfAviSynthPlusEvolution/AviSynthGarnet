@@ -355,6 +355,8 @@ std::string function_source(const std::string& signature) {
         c += 'a' - 'A';
     if ((optional && folded.find("__garnet_") == 0) || !used.insert(folded).second)
       throw std::runtime_error("Reserved or duplicate function parameter");
+    if (folded == "function")
+      throw std::runtime_error("Reserved AVS function parameter: function");
     if (i == signature.size())
       throw std::runtime_error("Missing function parameter type");
     const char* type;

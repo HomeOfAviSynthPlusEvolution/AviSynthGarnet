@@ -336,6 +336,10 @@ int main(int argc, char** argv) {
                  "Ruby callback nesting limit exceeded", "SystemStackError: stack level too deep");
   failure("AVS.export(:Twice, '[Width]i[width]i') {}", "duplicate");
   failure("AVS.filter(:Twice, args: {value: :unknown}) {}", "unknown AVS type");
+  failure("AVS.filter(:Twice, options: {'x]i[y' => :int}) {}", "invalid parameter name");
+  failure("AVS.function(options: {'x]i[y' => :int}) {}", "invalid parameter name");
+  failure("AVS.filter(:Twice, args: {'' => :int}) {}", "invalid parameter name");
+  failure("AVS.function(options: {__garnet_token: :int}) {}", "invalid parameter name");
   CHECK(argc == 2);
   {
     fake_host pipeline = {0};
