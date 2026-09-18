@@ -17,6 +17,7 @@ typedef struct fake_host {
   garnet_session* session;
   garnet_callback callback;
   void* callback_data;
+  garnet_value variable;
 } fake_host;
 typedef struct fake_clip {
   fake_host* host;
@@ -106,9 +107,33 @@ static garnet_result GARNET_CALL register_filter(void* identity, void* context, 
   host->callback_data = data;
   return r;
 }
+static garnet_result GARNET_CALL get_var(void* identity, void* context, garnet_string name) {
+  fake_host* host = (fake_host*)identity;
+  garnet_result r = {0};
+  CHECK(context == &host->context && equal(name, "test"));
+  r.value = host->variable;
+  return r;
+}
+static garnet_result GARNET_CALL set_var(void* identity, void* context, garnet_string name, const garnet_value* value,
+                                         int global) {
+  fake_host* host = (fake_host*)identity;
+  garnet_result r = {0};
+  CHECK(context == &host->context && equal(name, "test"));
+  CHECK(value->type == GARNET_INT || value->type == GARNET_BOOL || value->type == GARNET_UNDEFINED);
+  CHECK(global == 0 || global == 1);
+  host->variable = *value;
+  return r;
+}
 static garnet_host api(fake_host* host) {
-  garnet_host result = {GARNET_CONTRACT_REVISION, sizeof(garnet_host), host, invoke, retain, free_clip,
-                        register_filter};
+  garnet_host result = {GARNET_CONTRACT_REVISION,
+                        sizeof(garnet_host),
+                        host,
+                        invoke,
+                        retain,
+                        free_clip,
+                        register_filter,
+                        get_var,
+                        set_var};
   return result;
 }
 static garnet_session* create(fake_host* host) {
@@ -176,6 +201,10 @@ int main(int argc, char** argv) {
   release_result(r);
   r = eval(&host, "AVS.Reenter");
   CHECK(r.status == GARNET_OK);
+  release_result(r);
+  r = eval(&host, "raise unless AVS.get_var(:test, 42) == 42; AVS[:test] = false; raise unless AVS[:test] == false; "
+                  "AVS.set_global_var(:test, 0); AVS.get_var(:test, 42)");
+  CHECK(r.status == GARNET_OK && r.value.as.integer == 0);
   release_result(r);
   r = eval(&host, "factor = 2; AVS.export(:Twice, 'i') { |x| x == 0 ? 0 : AVS.Twice(x - 1) + factor }; AVS.Twice(21)");
   if (r.status != GARNET_OK)

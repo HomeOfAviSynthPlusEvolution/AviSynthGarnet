@@ -1,4 +1,7 @@
 module AVS
+  def self.function_exists?(name)
+    call(:FunctionExists, name.to_s)
+  end
   # Native signatures remain available through export; library authors normally
   # only need a readable schema and a block (or a block delegating to a class).
   def self.filter(name, args: {}, options: {}, &body)

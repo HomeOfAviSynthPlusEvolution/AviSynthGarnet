@@ -13,7 +13,7 @@ extern "C" {
 /* Private exact-match contract, not a stable public ABI. No exceptions may
  * cross it. Inputs are borrowed. Release results before destroying the host.
  * Destroy must not race with calls. Handles belong to exactly one host. */
-#define GARNET_CONTRACT_REVISION 2u
+#define GARNET_CONTRACT_REVISION 3u
 enum { GARNET_UNDEFINED, GARNET_BOOL, GARNET_INT, GARNET_FLOAT, GARNET_STRING, GARNET_ARRAY, GARNET_CLIP };
 enum { GARNET_OK, GARNET_ERROR, GARNET_INVALID_CONTRACT, GARNET_BUSY };
 typedef struct garnet_string {
@@ -58,6 +58,11 @@ typedef struct garnet_host {
   void(GARNET_CALL* release_clip)(void* identity, void* handle);
   garnet_result(GARNET_CALL* register_filter)(void* identity, void* call_context, garnet_string name,
                                               garnet_string signature, garnet_callback callback, void* data);
+  /* Undefined means absent/undefined. Assignment copies host values; it does not
+   * share mutable Ruby collections with the host. */
+  garnet_result(GARNET_CALL* get_var)(void* identity, void* call_context, garnet_string name);
+  garnet_result(GARNET_CALL* set_var)(void* identity, void* call_context, garnet_string name, const garnet_value* value,
+                                      int global);
 } garnet_host;
 #ifdef __cplusplus
 }

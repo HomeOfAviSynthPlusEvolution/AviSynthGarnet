@@ -8,8 +8,9 @@ typedef struct garnet_session garnet_session;
 /* On failure *out is null. Table is copied; identity remains borrowed. */
 garnet_result GARNET_CALL garnet_create(const garnet_host* host, garnet_session** out);
 /* Returns the last expression. Fresh parser locals, shared VM/constants.
- * Failed evaluation disables the session. Initial implementation rejects
- * concurrent/reentrant entry. Source and filename are borrowed UTF-8 spans. */
+ * Failed evaluation disables the session. These evaluation entrypoints reject
+ * concurrent/reentrant entry; registered callbacks allow same-thread nesting.
+ * Source and filename are borrowed UTF-8 spans. */
 garnet_result GARNET_CALL garnet_evaluate(garnet_session*, void* call_context, garnet_string source,
                                           garnet_string filename);
 /* Import a UTF-8 file path once per session. Repeated imports return the cached

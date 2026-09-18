@@ -140,6 +140,47 @@ garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string na
     return error("Unknown native invocation failure");
   }
 }
+std::string variable_name(garnet_string name) {
+  auto value = text(name);
+  if (value.empty() || value.find('\0') != std::string::npos)
+    throw std::runtime_error("Invalid variable name");
+  return value;
+}
+garnet_result GARNET_CALL get_var(void* identity, void* context, garnet_string name) {
+  try {
+    if (!context)
+      return error("Missing variable call context");
+    auto* env = static_cast<IScriptEnvironment*>(context);
+    return result(from_avs(*static_cast<Host*>(identity), env->GetVarDef(variable_name(name).c_str())));
+  } catch (const AvisynthError& e) {
+    return error(e.msg);
+  } catch (const std::exception& e) {
+    return error(e.what());
+  } catch (...) {
+    return error("Unknown variable read failure");
+  }
+}
+garnet_result GARNET_CALL set_var(void* identity, void* context, garnet_string name, const garnet_value* value,
+                                  int global) {
+  try {
+    if (!context || !value)
+      return error("Invalid variable assignment");
+    auto* env = static_cast<IScriptEnvironment*>(context);
+    const auto key = variable_name(name);
+    const auto converted = to_avs(*static_cast<Host*>(identity), env, *value);
+    const auto* saved = env->SaveString(key.c_str());
+    const bool ok = global ? env->SetGlobalVar(saved, converted) : env->SetVar(saved, converted);
+    if (!ok)
+      return error("Variable assignment failed");
+    return {};
+  } catch (const AvisynthError& e) {
+    return error(e.msg);
+  } catch (const std::exception& e) {
+    return error(e.what());
+  } catch (...) {
+    return error("Unknown variable assignment failure");
+  }
+}
 AVSValue __cdecl exported_filter(AVSValue args, void* data, IScriptEnvironment* env) {
   auto& entry = *static_cast<Export*>(data);
   try {
@@ -218,8 +259,15 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
     if (env->FunctionExists("ImportRuby"))
       throw std::runtime_error("ImportRuby already registered");
     auto host = std::make_unique<Host>();
-    host->api = {GARNET_CONTRACT_REVISION, sizeof(garnet_host), host.get(), invoke, retain_clip, release_clip,
-                 register_filter};
+    host->api = {GARNET_CONTRACT_REVISION,
+                 sizeof(garnet_host),
+                 host.get(),
+                 invoke,
+                 retain_clip,
+                 release_clip,
+                 register_filter,
+                 get_var,
+                 set_var};
     ResultGuard r(garnet_create(&host->api, &host->session));
     r.check();
     env->AtExit(shutdown, host.get());

@@ -282,6 +282,39 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
     mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
   }
 }
+mrb_value get_var(mrb_state* mrb, mrb_value) {
+  mrb_value key, fallback = mrb_nil_value();
+  mrb_get_args(mrb, "o|o", &key, &fallback);
+  try {
+    const auto name = name_of(mrb, key);
+    auto& s = session(mrb);
+    ResultGuard r(s.host.get_var(s.host.identity, s.call_context, span(name)));
+    r.check();
+    return r.value.value.type == GARNET_UNDEFINED ? fallback : to_ruby(mrb, r.value.value);
+  } catch (const std::exception& e) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
+  }
+}
+mrb_value assign_var(mrb_state* mrb, bool global) {
+  mrb_value key, value;
+  mrb_get_args(mrb, "oo", &key, &value);
+  try {
+    const auto name = name_of(mrb, key);
+    auto owned = from_ruby(mrb, value);
+    auto& s = session(mrb);
+    ResultGuard r(s.host.set_var(s.host.identity, s.call_context, span(name), &owned->value, global));
+    r.check();
+    return value;
+  } catch (const std::exception& e) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
+  }
+}
+mrb_value set_var(mrb_state* mrb, mrb_value) {
+  return assign_var(mrb, false);
+}
+mrb_value set_global_var(mrb_state* mrb, mrb_value) {
+  return assign_var(mrb, true);
+}
 mrb_value setup(mrb_state* mrb, void*) {
   auto* avs = mrb_define_module(mrb, "AVS");
   auto* clip = mrb_define_class_under(mrb, avs, "Clip", mrb->object_class);
@@ -296,6 +329,11 @@ mrb_value setup(mrb_state* mrb, void*) {
   mrb_define_class_method(mrb, avs, "call", invoke, args);
   mrb_define_class_method(mrb, avs, "method_missing", invoke, args);
   mrb_define_class_method(mrb, avs, "export", export_filter, MRB_ARGS_REQ(2) | MRB_ARGS_BLOCK());
+  mrb_define_class_method(mrb, avs, "get_var", get_var, MRB_ARGS_ARG(1, 1));
+  mrb_define_class_method(mrb, avs, "[]", get_var, MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, avs, "set_var", set_var, MRB_ARGS_REQ(2));
+  mrb_define_class_method(mrb, avs, "[]=", set_var, MRB_ARGS_REQ(2));
+  mrb_define_class_method(mrb, avs, "set_global_var", set_global_var, MRB_ARGS_REQ(2));
   mrb_define_method(mrb, mrb->kernel_module, "require_relative", require_relative, MRB_ARGS_REQ(1));
   mrb_load_nstring(mrb, garnet_runtime, sizeof(garnet_runtime) - 1);
   if (mrb->exc)
@@ -482,7 +520,8 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
   if (out)
     *out = nullptr;
   if (!out || !host || host->revision != GARNET_CONTRACT_REVISION || host->size != sizeof(garnet_host) ||
-      !host->identity || !host->invoke || !host->retain_clip || !host->release_clip || !host->register_filter)
+      !host->identity || !host->invoke || !host->retain_clip || !host->release_clip || !host->register_filter ||
+      !host->get_var || !host->set_var)
     return garnet::error("Invalid Garnet host contract", GARNET_INVALID_CONTRACT);
   try {
     auto s = std::make_unique<garnet_session>();
