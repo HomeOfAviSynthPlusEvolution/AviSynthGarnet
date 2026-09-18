@@ -1,0 +1,1 @@
+GarnetValue = 19

@@ -115,7 +115,7 @@ static void failure(const char* code, const char* expected) {
   garnet_destroy(s);
   CHECK(host.clips == 0);
 }
-int main(void) {
+int main(int argc, char** argv) {
   fake_host host = {0};
   garnet_host h = api(&host);
   garnet_session* s = NULL;
@@ -177,6 +177,42 @@ int main(void) {
   failure("def broken(", "syntax");
   failure("AVS.Missing", "unknown filter");
   failure("{}", "Expected");
+  CHECK(argc == 2);
+  {
+    fake_host imports = {0};
+    char path[4096];
+    garnet_session* loader = create(&imports);
+    snprintf(path, sizeof(path), "%s/main.avs.rb", argv[1]);
+    r = garnet_import(loader, &imports.context, str(path));
+    if (r.status != GARNET_OK)
+      fprintf(stderr, "%.*s\n", (int)r.error.size, r.error.data);
+    CHECK(r.status == GARNET_OK && r.value.as.integer == 42);
+    release_result(r);
+    r = garnet_import(loader, &imports.context, str(path));
+    CHECK(r.status == GARNET_OK && r.value.as.integer == 42);
+    release_result(r);
+    r = garnet_evaluate(loader, &imports.context, str("require_relative 'main.avs.rb'"), str(path));
+    CHECK(r.status == GARNET_OK && r.value.type == GARNET_BOOL && !r.value.as.integer);
+    release_result(r);
+    r = eval(&imports, "$garnet_late.call");
+    CHECK(r.status == GARNET_OK && r.value.as.integer == 19);
+    release_result(r);
+    garnet_destroy(loader);
+    loader = create(&imports);
+    snprintf(path, sizeof(path), "%s/cycle.avs.rb", argv[1]);
+    r = garnet_import(loader, &imports.context, str(path));
+    CHECK(r.status != GARNET_OK && strstr(r.error.data, "Circular"));
+    release_result(r);
+    garnet_destroy(loader);
+    loader = create(&imports);
+    r = garnet_evaluate(loader, &imports.context, str("begin; require_relative 'broken'; rescue; end; 42"), str(path));
+    CHECK(r.status != GARNET_OK && strstr(r.error.data, "failed nested import"));
+    release_result(r);
+    r = eval(&imports, "42");
+    CHECK(r.status != GARNET_OK && strstr(r.error.data, "disabled"));
+    release_result(r);
+    garnet_destroy(loader);
+  }
   puts("Garnet C host contract tests passed");
   return 0;
 }

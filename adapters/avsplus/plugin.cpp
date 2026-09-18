@@ -2,7 +2,6 @@
 #include <garnet/engine.h>
 #include "result.hpp"
 #include <filesystem>
-#include <fstream>
 #include <limits>
 
 const AVS_Linkage* AVS_linkage = nullptr;
@@ -145,14 +144,8 @@ AVSValue __cdecl import_ruby(AVSValue args, void* data, IScriptEnvironment* env)
         path = std::filesystem::u8path(dir.AsString()) / path;
     }
     path = std::filesystem::absolute(path).lexically_normal();
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-      throw std::runtime_error("Cannot open Ruby script: " + path.u8string());
-    std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    if (file.bad())
-      throw std::runtime_error("Cannot read Ruby script: " + path.u8string());
     const auto filename = path.u8string();
-    ResultGuard r(garnet_evaluate(host.session, env, span(source), span(filename)));
+    ResultGuard r(garnet_import(host.session, env, span(filename)));
     if (r.value.status != GARNET_OK)
       throw std::runtime_error(filename + ": " + text(r.value.error));
     return to_avs(host, env, r.value.value);

@@ -8,7 +8,13 @@
 #include <mruby/error.h>
 #include <mruby/hash.h>
 #include <mruby/string.h>
+#include <mruby/proc.h>
+#include <mruby/irep.h>
+#include <mruby/debug.h>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 static_assert(sizeof(mrb_int) == 8, "Garnet requires 64-bit mruby integers");
@@ -21,6 +27,9 @@ struct garnet_session {
   std::recursive_mutex gate;
   bool active = false;
   bool poisoned = false;
+  bool import_failed = false;
+  std::unordered_map<std::string, mrb_value> loaded;
+  std::unordered_set<std::string> loading;
   ~garnet_session() {
     if (ruby)
       mrb_close(ruby);
@@ -28,6 +37,35 @@ struct garnet_session {
 };
 namespace {
 using namespace garnet;
+mrb_value load_file(mrb_state*, const std::string&, bool*);
+mrb_value require_relative(mrb_state* mrb, mrb_value) {
+  const char* name;
+  mrb_get_args(mrb, "z", &name);
+  try {
+    const char* caller = nullptr;
+    for (auto* ci = mrb->c->ci; ci >= mrb->c->cibase; --ci) {
+      if (ci->proc && !MRB_PROC_CFUNC_P(ci->proc)) {
+        caller = mrb_debug_get_filename(mrb, ci->proc->body.irep, 0);
+        if (caller)
+          break;
+      }
+      if (ci == mrb->c->cibase)
+        break;
+    }
+    if (!caller || !*caller)
+      throw std::runtime_error("require_relative has no source filename");
+    auto path = std::filesystem::u8path(name);
+    if (path.is_relative())
+      path = std::filesystem::u8path(caller).parent_path() / path;
+    if (!std::filesystem::exists(path) && path.extension().empty())
+      path += ".rb";
+    bool cached = false;
+    load_file(mrb, path.u8string(), &cached);
+    return mrb_bool_value(!cached);
+  } catch (const std::exception& e) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
+  }
+}
 garnet_session& session(mrb_state* mrb) {
   return *static_cast<garnet_session*>(mrb->ud);
 }
@@ -193,6 +231,7 @@ mrb_value setup(mrb_state* mrb, void*) {
   mrb_define_method(mrb, clip, "method_missing", invoke, args);
   mrb_define_class_method(mrb, avs, "call", invoke, args);
   mrb_define_class_method(mrb, avs, "method_missing", invoke, args);
+  mrb_define_method(mrb, mrb->kernel_module, "require_relative", require_relative, MRB_ARGS_REQ(1));
   return mrb_nil_value();
 }
 mrb_value describe(mrb_state* mrb, void* p) {
@@ -225,19 +264,73 @@ struct Evaluation {
   garnet_string source;
   std::string filename;
   std::unique_ptr<Storage> output;
+  bool file = false;
 };
+mrb_value execute_source(mrb_state* mrb, garnet_string source, const std::string& filename) {
+  const auto deleter = [mrb](mrb_ccontext* p) {
+    mrb_ccontext_free(mrb, p);
+  };
+  std::unique_ptr<mrb_ccontext, decltype(deleter)> context(mrb_ccontext_new(mrb), deleter);
+  if (!context)
+    throw std::bad_alloc();
+  mrb_ccontext_filename(mrb, context.get(), filename.c_str());
+  context->capture_errors = true;
+  context->no_exec = true;
+  auto proc = mrb_load_nstring_cxt(mrb, source.data ? source.data : "", source.size, context.get());
+  if (mrb->exc)
+    mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
+  auto* compiled = mrb_proc_ptr(proc);
+  // Compilation inside require_relative must not capture its Kernel scope.
+  compiled->upper = nullptr;
+  MRB_PROC_SET_TARGET_CLASS(compiled, mrb->object_class);
+  // Unlike mrb_top_run, this preserves the caller's active Ruby stack/locals
+  // when a library is loaded from inside another Ruby method.
+  return mrb_yield_with_class(mrb, proc, 0, nullptr, mrb_top_self(mrb), mrb->object_class);
+}
+mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached) {
+  auto& s = session(mrb);
+  const auto path = std::filesystem::canonical(std::filesystem::u8path(filename));
+  const auto resolved = path.u8string();
+  auto key = resolved;
+#ifdef _WIN32
+  key = fold(key);
+#endif
+  const auto found = s.loaded.find(key);
+  if (found != s.loaded.end()) {
+    if (cached)
+      *cached = true;
+    return found->second;
+  }
+  if (s.loading.count(key))
+    throw std::runtime_error("Circular Ruby import: " + resolved);
+  std::ifstream input(path, std::ios::binary);
+  if (!input)
+    throw std::runtime_error("Cannot open Ruby script: " + resolved);
+  const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  if (input.bad())
+    throw std::runtime_error("Cannot read Ruby script: " + resolved);
+  s.loading.insert(key);
+  try {
+    auto value = execute_source(mrb, span(source), resolved);
+    mrb_gc_register(mrb, value);
+    try {
+      s.loaded.emplace(key, value);
+    } catch (...) {
+      mrb_gc_unregister(mrb, value);
+      throw;
+    }
+    s.loading.erase(key);
+    return value;
+  } catch (...) {
+    s.loading.erase(key);
+    s.import_failed = true;
+    throw;
+  }
+}
 mrb_value evaluate_body(mrb_state* mrb, void* data) {
   try {
     auto& e = *static_cast<Evaluation*>(data);
-    const auto deleter = [mrb](mrb_ccontext* p) {
-      mrb_ccontext_free(mrb, p);
-    };
-    std::unique_ptr<mrb_ccontext, decltype(deleter)> context(mrb_ccontext_new(mrb), deleter);
-    if (!context)
-      throw std::bad_alloc();
-    mrb_ccontext_filename(mrb, context.get(), e.filename.c_str());
-    context->capture_errors = true;
-    auto value = mrb_load_nstring_cxt(mrb, e.source.data ? e.source.data : "", e.source.size, context.get());
+    auto value = e.file ? load_file(mrb, e.filename, nullptr) : execute_source(mrb, e.source, e.filename);
     if (!mrb->exc)
       e.output = from_ruby(mrb, value);
     return value;
@@ -285,8 +378,8 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
     return garnet::error("Unknown engine initialization error");
   }
 }
-extern "C" garnet_result GARNET_CALL garnet_evaluate(garnet_session* s, void* context, garnet_string source,
-                                                     garnet_string filename) {
+static garnet_result evaluate(garnet_session* s, void* context, garnet_string source, garnet_string filename,
+                              bool file) {
   if (!s || (!source.data && source.size))
     return garnet::error("Invalid evaluation input");
   try {
@@ -295,7 +388,7 @@ extern "C" garnet_result GARNET_CALL garnet_evaluate(garnet_session* s, void* co
       return garnet::error("Concurrent or reentrant Ruby entry", GARNET_BUSY);
     if (s->poisoned)
       return garnet::error("Ruby session disabled after failed evaluation");
-    Evaluation e{source, garnet::text(filename), nullptr};
+    Evaluation e{source, garnet::text(filename), nullptr, file};
     if (e.filename.find('\0') != std::string::npos)
       return garnet::error("NUL in filename");
     Active active(*s, context);
@@ -303,6 +396,8 @@ extern "C" garnet_result GARNET_CALL garnet_evaluate(garnet_session* s, void* co
     mrb_bool failed = false;
     auto value = mrb_protect_error(s->ruby, evaluate_body, &e, &failed);
     check_ruby(s->ruby, failed, value);
+    if (s->import_failed)
+      throw std::runtime_error("Ruby session disabled after a failed nested import");
     auto output = garnet::result(std::move(e.output));
     s->poisoned = false;
     return output;
@@ -311,6 +406,13 @@ extern "C" garnet_result GARNET_CALL garnet_evaluate(garnet_session* s, void* co
   } catch (...) {
     return garnet::error("Unknown Ruby evaluation error");
   }
+}
+extern "C" garnet_result GARNET_CALL garnet_evaluate(garnet_session* s, void* context, garnet_string source,
+                                                     garnet_string filename) {
+  return evaluate(s, context, source, filename, false);
+}
+extern "C" garnet_result GARNET_CALL garnet_import(garnet_session* s, void* context, garnet_string filename) {
+  return evaluate(s, context, {}, filename, true);
 }
 extern "C" void GARNET_CALL garnet_destroy(garnet_session* s) {
   delete s;
