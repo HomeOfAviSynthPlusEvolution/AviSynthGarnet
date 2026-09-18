@@ -1,5 +1,6 @@
 #include <garnet/engine.h>
 #include "result.hpp"
+#include "runtime.hpp"
 #include <mruby.h>
 #include <mruby/array.h>
 #include <mruby/class.h>
@@ -19,6 +20,10 @@
 
 static_assert(sizeof(mrb_int) == 8, "Garnet requires 64-bit mruby integers");
 static_assert(sizeof(mrb_float) == 8, "Garnet requires double precision mruby");
+struct Export {
+  garnet_session* session;
+  mrb_value block;
+};
 struct garnet_session {
   garnet_host host{};
   mrb_state* ruby = nullptr;
@@ -26,10 +31,12 @@ struct garnet_session {
   void* call_context = nullptr;
   std::recursive_mutex gate;
   bool active = false;
+  unsigned depth = 0;
   bool poisoned = false;
   bool import_failed = false;
   std::unordered_map<std::string, mrb_value> loaded;
   std::unordered_set<std::string> loading;
+  std::vector<std::unique_ptr<Export>> exports;
   ~garnet_session() {
     if (ruby)
       mrb_close(ruby);
@@ -166,6 +173,63 @@ std::string fold(std::string s) {
       c += 'a' - 'A';
   return s;
 }
+garnet_result GARNET_CALL call_export(void*, void*, const garnet_value*, size_t);
+bool identifier(const std::string& name) {
+  if (name.empty())
+    return false;
+  for (size_t i = 0; i < name.size(); ++i) {
+    const char c = name[i];
+    if (!(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i && c >= '0' && c <= '9')))
+      return false;
+  }
+  return true;
+}
+void validate_signature(const std::string& signature) {
+  std::unordered_set<std::string> names;
+  size_t count = 0;
+  for (size_t i = 0; i < signature.size();) {
+    if (++count > 256)
+      throw std::runtime_error("Too many exported parameters");
+    if (signature[i] == '[') {
+      const auto end = signature.find(']', ++i);
+      if (end == std::string::npos)
+        throw std::runtime_error("Unclosed parameter name");
+      auto name = signature.substr(i, end - i);
+      if (!identifier(name) || !names.insert(fold(name)).second)
+        throw std::runtime_error("Invalid or duplicate exported parameter name");
+      i = end + 1;
+    }
+    if (i == signature.size() || std::string("cbifs.").find(signature[i++]) == std::string::npos)
+      throw std::runtime_error("Unsupported exported parameter type");
+  }
+}
+mrb_value export_filter(mrb_state* mrb, mrb_value) {
+  mrb_value name, signature, block;
+  mrb_get_args(mrb, "oo&", &name, &signature, &block);
+  try {
+    auto& s = session(mrb);
+    if (mrb_nil_p(block))
+      throw std::runtime_error("AVS.export requires a block");
+    const auto function = name_of(mrb, name);
+    const auto params = name_of(mrb, signature);
+    if (!identifier(function))
+      throw std::runtime_error("Invalid exported function name");
+    validate_signature(params);
+    if (s.exports.size() >= 4096)
+      throw std::runtime_error("Too many exported functions");
+    auto entry = std::make_unique<Export>(Export{&s, block});
+    mrb_gc_register(mrb, block);
+    // Keep the callback alive even if a host reports failure after registration.
+    auto* data = entry.get();
+    s.exports.push_back(std::move(entry));
+    ResultGuard r(
+        s.host.register_filter(s.host.identity, s.call_context, span(function), span(params), call_export, data));
+    r.check();
+    return mrb_nil_value();
+  } catch (const std::exception& e) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
+  }
+}
 mrb_value invoke(mrb_state* mrb, mrb_value self) {
   mrb_value *values, block, keywords;
   mrb_int count;
@@ -231,7 +295,11 @@ mrb_value setup(mrb_state* mrb, void*) {
   mrb_define_method(mrb, clip, "method_missing", invoke, args);
   mrb_define_class_method(mrb, avs, "call", invoke, args);
   mrb_define_class_method(mrb, avs, "method_missing", invoke, args);
+  mrb_define_class_method(mrb, avs, "export", export_filter, MRB_ARGS_REQ(2) | MRB_ARGS_BLOCK());
   mrb_define_method(mrb, mrb->kernel_module, "require_relative", require_relative, MRB_ARGS_REQ(1));
+  mrb_load_nstring(mrb, garnet_runtime, sizeof(garnet_runtime) - 1);
+  if (mrb->exc)
+    mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
   return mrb_nil_value();
 }
 mrb_value describe(mrb_state* mrb, void* p) {
@@ -341,24 +409,80 @@ mrb_value evaluate_body(mrb_state* mrb, void* data) {
 struct Active {
   garnet_session& s;
   int arena;
-  Active(garnet_session& session, void* context) : s(session), arena(mrb_gc_arena_save(s.ruby)) {
+  void* previous_context;
+  bool previous_active;
+  bool done = false;
+  Active(garnet_session& session, void* context)
+      : s(session), arena(mrb_gc_arena_save(s.ruby)), previous_context(s.call_context), previous_active(s.active) {
     s.call_context = context;
     s.active = true;
+    ++s.depth;
   }
   ~Active() {
-    s.call_context = nullptr;
+    if (!done)
+      s.poisoned = true;
+    s.call_context = previous_context;
     s.ruby->exc = nullptr;
-    s.active = false;
+    s.active = previous_active;
+    --s.depth;
     mrb_gc_arena_restore(s.ruby, arena);
   }
 };
+struct CallbackCall {
+  Export& entry;
+  const garnet_value* args;
+  size_t count;
+  std::unique_ptr<Storage> output;
+};
+mrb_value callback_body(mrb_state* mrb, void* data) {
+  try {
+    auto& call = *static_cast<CallbackCall*>(data);
+    std::vector<mrb_value> args;
+    for (size_t i = 0; i < call.count; ++i)
+      args.push_back(to_ruby(mrb, call.args[i]));
+    auto value = mrb_yield_argv(mrb, call.entry.block, static_cast<mrb_int>(args.size()), args.data());
+    call.output = from_ruby(mrb, value);
+    return value;
+  } catch (const std::exception& e) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
+  }
+}
+garnet_result GARNET_CALL call_export(void* data, void* context, const garnet_value* args, size_t count) {
+  try {
+    auto& entry = *static_cast<Export*>(data);
+    auto& s = *entry.session;
+    std::unique_lock<std::recursive_mutex> lock(s.gate, std::try_to_lock);
+    if (!lock.owns_lock())
+      return error("Concurrent Ruby entry", GARNET_BUSY);
+    if (s.poisoned)
+      return error("Ruby session disabled after failed evaluation");
+    if (count > 32767 || (count && !args))
+      return error("Invalid callback arguments");
+    if (s.depth >= 64)
+      return error("Ruby callback nesting limit exceeded");
+    Active active(s, context);
+    CallbackCall call{entry, args, count, nullptr};
+    mrb_bool failed = false;
+    auto value = mrb_protect_error(s.ruby, callback_body, &call, &failed);
+    check_ruby(s.ruby, failed, value);
+    if (s.poisoned || s.import_failed)
+      throw std::runtime_error("Ruby session disabled after nested failure");
+    auto out = result(std::move(call.output));
+    active.done = true;
+    return out;
+  } catch (const std::exception& e) {
+    return error(e.what());
+  } catch (...) {
+    return error("Unknown Ruby callback error");
+  }
+}
 } // namespace
 
 extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garnet_session** out) {
   if (out)
     *out = nullptr;
   if (!out || !host || host->revision != GARNET_CONTRACT_REVISION || host->size != sizeof(garnet_host) ||
-      !host->identity || !host->invoke || !host->retain_clip || !host->release_clip)
+      !host->identity || !host->invoke || !host->retain_clip || !host->release_clip || !host->register_filter)
     return garnet::error("Invalid Garnet host contract", GARNET_INVALID_CONTRACT);
   try {
     auto s = std::make_unique<garnet_session>();
@@ -392,14 +516,13 @@ static garnet_result evaluate(garnet_session* s, void* context, garnet_string so
     if (e.filename.find('\0') != std::string::npos)
       return garnet::error("NUL in filename");
     Active active(*s, context);
-    s->poisoned = true;
     mrb_bool failed = false;
     auto value = mrb_protect_error(s->ruby, evaluate_body, &e, &failed);
     check_ruby(s->ruby, failed, value);
-    if (s->import_failed)
+    if (s->poisoned || s->import_failed)
       throw std::runtime_error("Ruby session disabled after a failed nested import");
     auto output = garnet::result(std::move(e.output));
-    s->poisoned = false;
+    active.done = true;
     return output;
   } catch (const std::exception& e) {
     return garnet::error(e.what());

@@ -13,7 +13,7 @@ extern "C" {
 /* Private exact-match contract, not a stable public ABI. No exceptions may
  * cross it. Inputs are borrowed. Release results before destroying the host.
  * Destroy must not race with calls. Handles belong to exactly one host. */
-#define GARNET_CONTRACT_REVISION 1u
+#define GARNET_CONTRACT_REVISION 2u
 enum { GARNET_UNDEFINED, GARNET_BOOL, GARNET_INT, GARNET_FLOAT, GARNET_STRING, GARNET_ARRAY, GARNET_CLIP };
 enum { GARNET_OK, GARNET_ERROR, GARNET_INVALID_CONTRACT, GARNET_BUSY };
 typedef struct garnet_string {
@@ -41,6 +41,11 @@ typedef struct garnet_result {
   void* owner;
   void(GARNET_CALL* release)(void* owner);
 } garnet_result;
+/* A registered callback receives positional values in signature order, including
+ * undefined placeholders for omitted optional arguments. It remains valid until
+ * session destruction. The host must not call it during/after destruction. */
+typedef garnet_result(GARNET_CALL* garnet_callback)(void* data, void* call_context, const garnet_value* args,
+                                                    size_t count);
 typedef struct garnet_host {
   uint32_t revision;
   uint32_t size;
@@ -51,6 +56,8 @@ typedef struct garnet_host {
   /* Retain returns a new owned handle in a result, or an error. */
   garnet_result(GARNET_CALL* retain_clip)(void* identity, void* handle);
   void(GARNET_CALL* release_clip)(void* identity, void* handle);
+  garnet_result(GARNET_CALL* register_filter)(void* identity, void* call_context, garnet_string name,
+                                              garnet_string signature, garnet_callback callback, void* data);
 } garnet_host;
 #ifdef __cplusplus
 }

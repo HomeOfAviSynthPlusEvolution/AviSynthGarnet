@@ -8,6 +8,11 @@ const AVS_Linkage* AVS_linkage = nullptr;
 namespace {
 using namespace garnet;
 struct Host;
+struct Export {
+  Host* host;
+  garnet_callback callback;
+  void* data;
+};
 struct Clip {
   Host* host;
   PClip clip;
@@ -15,6 +20,7 @@ struct Clip {
 struct Host {
   garnet_host api{};
   garnet_session* session = nullptr;
+  std::vector<std::unique_ptr<Export>> exports;
   ~Host() { garnet_destroy(session); }
 };
 void GARNET_CALL release_clip(void*, void* p) {
@@ -134,6 +140,47 @@ garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string na
     return error("Unknown native invocation failure");
   }
 }
+AVSValue __cdecl exported_filter(AVSValue args, void* data, IScriptEnvironment* env) {
+  auto& entry = *static_cast<Export*>(data);
+  try {
+    auto owned = from_avs(*entry.host, args);
+    if (owned->value.type != GARNET_ARRAY)
+      throw std::runtime_error("Invalid exported argument list");
+    ResultGuard r(entry.callback(entry.data, env, owned->value.as.array.data, owned->value.as.array.size));
+    r.check();
+    return to_avs(*entry.host, env, r.value.value);
+  } catch (const std::exception& e) {
+    env->ThrowError("Garnet filter: %s", e.what());
+  } catch (...) {
+    env->ThrowError("Garnet filter: unknown callback failure");
+  }
+  return AVSValue();
+}
+garnet_result GARNET_CALL register_filter(void* identity, void* context, garnet_string name, garnet_string signature,
+                                          garnet_callback callback, void* data) {
+  try {
+    auto& host = *static_cast<Host*>(identity);
+    auto* env = static_cast<IScriptEnvironment*>(context);
+    if (!env || !callback)
+      return error("Invalid filter registration");
+    const auto function = text(name), params = text(signature);
+    if (function.empty() || function.find('\0') != std::string::npos || params.find('\0') != std::string::npos)
+      return error("Invalid filter registration strings");
+    if (env->FunctionExists(function.c_str()))
+      return error(("Exported filter name already exists: " + function).c_str());
+    auto entry = std::make_unique<Export>(Export{&host, callback, data});
+    auto* token = entry.get();
+    host.exports.push_back(std::move(entry));
+    env->AddFunction(env->SaveString(function.c_str()), env->SaveString(params.c_str()), exported_filter, token);
+    return {};
+  } catch (const AvisynthError& e) {
+    return error(e.msg);
+  } catch (const std::exception& e) {
+    return error(e.what());
+  } catch (...) {
+    return error("Unknown filter registration failure");
+  }
+}
 AVSValue __cdecl import_ruby(AVSValue args, void* data, IScriptEnvironment* env) {
   auto& host = *static_cast<Host*>(data);
   try {
@@ -171,7 +218,8 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
     if (env->FunctionExists("ImportRuby"))
       throw std::runtime_error("ImportRuby already registered");
     auto host = std::make_unique<Host>();
-    host->api = {GARNET_CONTRACT_REVISION, sizeof(garnet_host), host.get(), invoke, retain_clip, release_clip};
+    host->api = {GARNET_CONTRACT_REVISION, sizeof(garnet_host), host.get(), invoke, retain_clip, release_clip,
+                 register_filter};
     ResultGuard r(garnet_create(&host->api, &host->session));
     r.check();
     env->AtExit(shutdown, host.get());

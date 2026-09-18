@@ -15,6 +15,8 @@ typedef struct fake_host {
   int clips;
   int context;
   garnet_session* session;
+  garnet_callback callback;
+  void* callback_data;
 } fake_host;
 typedef struct fake_clip {
   fake_host* host;
@@ -80,14 +82,33 @@ static garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_st
     garnet_result nested = garnet_evaluate(host->session, context, str("1"), str("nested.rb"));
     CHECK(nested.status == GARNET_BUSY);
     release_result(nested);
+  } else if (equal(name, "Twice")) {
+    CHECK(host->callback);
+    return host->callback(host->callback_data, context, args, count);
   } else {
     r.status = GARNET_ERROR;
     r.error = str("Fake host: unknown filter");
   }
   return r;
 }
+static garnet_result GARNET_CALL register_filter(void* identity, void* context, garnet_string name,
+                                                 garnet_string signature, garnet_callback callback, void* data) {
+  fake_host* host = (fake_host*)identity;
+  garnet_result r = {0};
+  CHECK(context == &host->context);
+  CHECK(equal(name, "Twice") && equal(signature, "i"));
+  if (host->callback) {
+    r.status = GARNET_ERROR;
+    r.error = str("duplicate export");
+    return r;
+  }
+  host->callback = callback;
+  host->callback_data = data;
+  return r;
+}
 static garnet_host api(fake_host* host) {
-  garnet_host result = {GARNET_CONTRACT_REVISION, sizeof(garnet_host), host, invoke, retain, free_clip};
+  garnet_host result = {GARNET_CONTRACT_REVISION, sizeof(garnet_host), host, invoke, retain, free_clip,
+                        register_filter};
   return result;
 }
 static garnet_session* create(fake_host* host) {
@@ -156,6 +177,14 @@ int main(int argc, char** argv) {
   r = eval(&host, "AVS.Reenter");
   CHECK(r.status == GARNET_OK);
   release_result(r);
+  r = eval(&host, "factor = 2; AVS.export(:Twice, 'i') { |x| x == 0 ? 0 : AVS.Twice(x - 1) + factor }; AVS.Twice(21)");
+  if (r.status != GARNET_OK)
+    fprintf(stderr, "%.*s\n", (int)r.error.size, r.error.data);
+  CHECK(r.status == GARNET_OK && r.value.as.integer == 42);
+  release_result(r);
+  r = eval(&host, "GC.start; AVS.Twice(3)");
+  CHECK(r.status == GARNET_OK && r.value.as.integer == 6);
+  release_result(r);
   r = eval(&host, "clip = AVS.Source; clip.Resize(width: 320, height: 240)");
   CHECK(r.status == GARNET_OK && r.value.type == GARNET_CLIP);
   release_result(r);
@@ -177,6 +206,11 @@ int main(int argc, char** argv) {
   failure("def broken(", "syntax");
   failure("AVS.Missing", "unknown filter");
   failure("{}", "Expected");
+  failure("AVS.export(:Twice, 'i') {} ; AVS.export(:Twice, 'i') {}", "duplicate export");
+  failure("AVS.export(:Twice, 'i') { raise 'callback failed' }; AVS.Twice(1)", "callback failed");
+  failure("AVS.export(:Twice, 'i') { |x| AVS.Twice(x) }; AVS.Twice(1)", "nesting limit");
+  failure("AVS.export(:Twice, '[Width]i[width]i') {}", "duplicate");
+  failure("AVS.filter(:Twice, args: {value: :unknown}) {}", "unknown AVS type");
   CHECK(argc == 2);
   {
     fake_host imports = {0};
