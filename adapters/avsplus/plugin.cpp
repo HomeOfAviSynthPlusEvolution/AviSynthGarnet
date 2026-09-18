@@ -180,6 +180,41 @@ struct LocalContext {
   explicit LocalContext(IScriptEnvironment* env) : env(env) { env->PushContext(); }
   ~LocalContext() { env->PopContext(); }
 };
+// Script variables cannot count nested imports: each AVS function/context
+// hides its caller's locals. Keep the guard on the native thread instead.
+struct PipelineDepth {
+  static thread_local PipelineDepth* current;
+  PipelineDepth* previous;
+  const std::filesystem::path& path;
+  unsigned depth;
+  explicit PipelineDepth(const std::filesystem::path& path)
+      : previous(current), path(path), depth(previous ? previous->depth + 1 : 1) {
+    for (auto* entry = previous; entry; entry = entry->previous)
+      if (std::filesystem::equivalent(entry->path, path))
+        throw std::runtime_error("Circular pipeline import");
+    // Native Import/Eval consumes much more stack than a Ruby VM call.
+    if (depth > 16)
+      throw std::runtime_error("Pipeline script nesting limit exceeded");
+    current = this;
+  }
+  ~PipelineDepth() { current = previous; }
+};
+thread_local PipelineDepth* PipelineDepth::current = nullptr;
+
+struct ScriptMetadata {
+  IScriptEnvironment* env;
+  const char* names[6] = {"$ScriptName$", "$ScriptFile$", "$ScriptDir$",
+                         "$ScriptNameUtf8$", "$ScriptFileUtf8$", "$ScriptDirUtf8$"};
+  AVSValue values[6];
+  explicit ScriptMetadata(IScriptEnvironment* env) : env(env) {
+    for (int i = 0; i < 6; ++i)
+      values[i] = env->GetVarDef(names[i]);
+  }
+  ~ScriptMetadata() {
+    for (int i = 0; i < 6; ++i)
+      env->SetGlobalVar(names[i], values[i]);
+  }
+};
 garnet_result GARNET_CALL invoke_function(void* identity, void* context, void* handle, const garnet_value* args,
                                           const garnet_string* names, size_t count) {
   try {
@@ -400,11 +435,8 @@ AVSValue __cdecl import_script(AVSValue args, void* data, IScriptEnvironment* en
       throw std::runtime_error("ImportScript expects .avs, .avsi or .rb");
     // Local variables and last are scoped; explicit globals and registered
     // functions keep their normal AVS semantics.
+    PipelineDepth depth(path);
     LocalContext local(env);
-    const auto depth = env->GetVarDef("__garnet_import_depth", 0).AsInt();
-    if (depth >= 64)
-      throw std::runtime_error("Pipeline script nesting limit exceeded");
-    env->SetVar("__garnet_import_depth", depth + 1);
     env->SetVar("last", args[0]);
     AVSValue value;
     if (extension == ".rb") {
@@ -415,6 +447,8 @@ AVSValue __cdecl import_script(AVSValue args, void* data, IScriptEnvironment* en
       // filename is UTF-8; request the native Import UTF-8 path mode.
       AVSValue values[] = {env->SaveString(filename.c_str()), true};
       const char* names[] = {nullptr, "utf8"};
+      // Some upstream versions restore these globals only on successful Import.
+      ScriptMetadata metadata(env);
       value = env->Invoke("Import", AVSValue(values, 2), names);
     }
     if (!value.IsClip())
