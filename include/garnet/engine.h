@@ -10,7 +10,10 @@ garnet_result GARNET_CALL garnet_create(const garnet_host* host, garnet_session*
 /* Returns the last expression. Fresh parser locals, shared VM/constants.
  * Failed evaluation disables the session. These evaluation entrypoints reject
  * concurrent/reentrant evaluation; file imports and registered callbacks allow
- * bounded same-thread nesting.
+ * bounded same-thread nesting. Registered callbacks serialize access to the VM,
+ * waiting up to five seconds for another thread before returning GARNET_BUSY.
+ * This bounds cross-thread host dependency waits; it does not provide parallel
+ * Ruby execution or guarantee success for arbitrary nested frame requests.
  * Source and filename are borrowed UTF-8 spans. */
 garnet_result GARNET_CALL garnet_evaluate(garnet_session*, void* call_context, garnet_string source,
                                           garnet_string filename);

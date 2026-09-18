@@ -5,9 +5,10 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 int main(int argc, char** argv) {
-  if (argc != 4) {
+  if (argc != 4 && argc != 5) {
     std::fprintf(stderr, "usage: avs_tests runtime plugin script\n");
     return 2;
   }
@@ -37,6 +38,8 @@ int main(int argc, char** argv) {
   LOAD(avs_get_row_size_p)
   LOAD(avs_get_height_p)
   LOAD(avs_clip_get_error)
+  LOAD(avs_get_frame_props_ro)
+  LOAD(avs_prop_get_int)
 #undef LOAD
   auto* env = avs_create_script_environment(6);
   if (!env) {
@@ -72,13 +75,24 @@ int main(int argc, char** argv) {
     }
     ruby = avs_take_clip(output, env);
     avs_release_value(output);
-    auto expected = call("Eval", "ColorBars(width=720,height=480,pixel_type=\"YV12\").BilinearResize(360,240)");
+    auto expected =
+        call("Eval", argc == 5 ? "ColorBars(width=720,height=480,pixel_type=\"YV12\").ScriptClip(\"last.BilinearResize("
+                                 "360,240).PointResize(720,480)\").PointResize(360,240)"
+                               : "ColorBars(width=720,height=480,pixel_type=\"YV12\").BilinearResize(360,240)");
     reference = avs_take_clip(expected, env);
     avs_release_value(expected);
     const auto* vi = avs_get_video_info(ruby);
     if (vi->width != 360 || vi->height != 240)
       throw std::runtime_error("Wrong output size");
-    for (int n : {0, 1, 3, 1}) {
+    std::vector<int> requests{0, 1, 3, 1};
+    if (argc == 5) {
+      requests.clear();
+      for (int n = 0; n < 64; ++n)
+        requests.push_back(n);
+      for (int n : {31, 2, 48, 1})
+        requests.push_back(n);
+    }
+    for (int n : requests) {
       auto* actual_frame = avs_get_frame(ruby, n);
       if (!actual_frame)
         throw std::runtime_error(avs_clip_get_error(ruby));
@@ -88,6 +102,15 @@ int main(int argc, char** argv) {
         throw std::runtime_error(avs_clip_get_error(reference));
       }
       bool equal = true;
+      if (argc == 5) {
+        int error = 0;
+        const auto* properties = avs_get_frame_props_ro(env, actual_frame);
+        const auto stamp = avs_prop_get_int(env, properties, "garnet_n", 0, &error);
+        equal = !error && stamp == n;
+        if (!equal)
+          std::fprintf(stderr, "Frame %d: missing/wrong Ruby stamp (error=%d, stamp=%lld)\n", n, error,
+                       static_cast<long long>(stamp));
+      }
       for (int plane : {AVS_PLANAR_Y, AVS_PLANAR_U, AVS_PLANAR_V}) {
         int rows = avs_get_height_p(actual_frame, plane), bytes = avs_get_row_size_p(actual_frame, plane);
         const auto* a = avs_get_read_ptr_p(actual_frame, plane);
@@ -105,7 +128,8 @@ int main(int argc, char** argv) {
       if (!equal)
         throw std::runtime_error("Frame differs from native AVS graph");
     }
-    std::puts("Ruby main returned 360x240 YV12; frames 0,1,3,1 match native AVS byte-for-byte");
+    std::printf("Ruby main returned 360x240 YV12; %zu frame requests match native AVS byte-for-byte\n",
+                requests.size());
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     status = 1;

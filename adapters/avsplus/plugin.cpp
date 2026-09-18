@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <limits>
 #include <unordered_set>
+#include <mutex>
 
 const AVS_Linkage* AVS_linkage = nullptr;
 namespace {
@@ -24,9 +25,11 @@ struct Function {
 };
 struct Host {
   garnet_host api{};
+  IScriptEnvironment* environment = nullptr;
   garnet_session* session = nullptr;
   std::vector<std::unique_ptr<Export>> exports;
   std::vector<std::unique_ptr<Export>> functions;
+  std::mutex functions_gate;
   ~Host() { garnet_destroy(session); }
 };
 void GARNET_CALL release_clip(void*, void* p) {
@@ -163,7 +166,12 @@ garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string na
     std::vector<const char*> pointers;
     for (const auto& s : strings)
       pointers.push_back(s.empty() ? nullptr : s.c_str());
-    auto value = env->Invoke(function.c_str(), AVSValue(values.data(), static_cast<int>(count)), pointers.data());
+    // Runtime-created filters may keep their constructor environment until
+    // Ruby GC releases them, after the Prefetch worker has gone away. The
+    // initialization environment lives through AtExit and dispatches runtime
+    // variables through AviSynth's current-thread TLS.
+    auto value =
+        host.environment->Invoke(function.c_str(), AVSValue(values.data(), static_cast<int>(count)), pointers.data());
     return result(from_avs(host, value));
   } catch (const IScriptEnvironment::NotFound&) {
     return error("AVS filter or matching overload not found");
@@ -203,8 +211,8 @@ thread_local PipelineDepth* PipelineDepth::current = nullptr;
 
 struct ScriptMetadata {
   IScriptEnvironment* env;
-  const char* names[6] = {"$ScriptName$", "$ScriptFile$", "$ScriptDir$",
-                         "$ScriptNameUtf8$", "$ScriptFileUtf8$", "$ScriptDirUtf8$"};
+  const char* names[6] = {"$ScriptName$",     "$ScriptFile$",     "$ScriptDir$",
+                          "$ScriptNameUtf8$", "$ScriptFileUtf8$", "$ScriptDirUtf8$"};
   AVSValue values[6];
   explicit ScriptMetadata(IScriptEnvironment* env) : env(env) {
     for (int i = 0; i < 6; ++i)
@@ -322,9 +330,17 @@ garnet_result GARNET_CALL register_filter(void* identity, void* context, garnet_
 AVSValue __cdecl dispatch_function(AVSValue args, void* data, IScriptEnvironment* env) {
   auto& host = *static_cast<Host*>(data);
   const auto token = args[0].AsLong();
-  if (token < 1 || static_cast<uint64_t>(token) > host.functions.size() || !args[1].IsArray())
+  Export* entry = nullptr;
+  {
+    // Lookups occur before entering the VM; another callback may append a
+    // function and reallocate the vector. Never hold this lock across Ruby.
+    std::lock_guard<std::mutex> lock(host.functions_gate);
+    if (token >= 1 && static_cast<uint64_t>(token) <= host.functions.size())
+      entry = host.functions[static_cast<size_t>(token - 1)].get();
+  }
+  if (!entry || !args[1].IsArray())
     env->ThrowError("Garnet: invalid function dispatch");
-  return exported_filter(args[1], host.functions[static_cast<size_t>(token - 1)].get(), env);
+  return exported_filter(args[1], entry, env);
 }
 std::string function_source(const std::string& signature) {
   std::string params, values;
@@ -399,13 +415,20 @@ garnet_result GARNET_CALL make_function(void* identity, void* context, garnet_st
   try {
     auto& host = *static_cast<Host*>(identity);
     auto* env = static_cast<IScriptEnvironment*>(context);
-    if (!env || !callback || host.functions.size() >= 4096)
+    if (!env || !callback)
       return error("Cannot create Garnet function");
     const auto source = function_source(text(signature));
     auto entry = std::make_unique<Export>(Export{&host, callback, data});
-    host.functions.push_back(std::move(entry));
+    size_t token;
+    {
+      std::lock_guard<std::mutex> lock(host.functions_gate);
+      if (host.functions.size() >= 4096)
+        return error("Cannot create Garnet function");
+      host.functions.push_back(std::move(entry));
+      token = host.functions.size();
+    }
     LocalContext local(env);
-    env->SetVar("__garnet_token", AVSValue(static_cast<int64_t>(host.functions.size())));
+    env->SetVar("__garnet_token", AVSValue(static_cast<int64_t>(token)));
     const auto value = env->Invoke("Eval", AVSValue(source.c_str()));
     if (!value.IsFunction())
       return error("AVS did not create a function value");
@@ -502,6 +525,9 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
     if (env->FunctionExists("__GarnetDispatch"))
       throw std::runtime_error("Garnet dispatcher already registered");
     auto host = std::make_unique<Host>();
+    if (env->GetEnvProperty(AEP_THREAD_ID) != 0)
+      throw std::runtime_error("Load Garnet during script initialization, not in a frame worker");
+    host->environment = env;
     host->api = {GARNET_CONTRACT_REVISION,
                  sizeof(garnet_host),
                  host.get(),

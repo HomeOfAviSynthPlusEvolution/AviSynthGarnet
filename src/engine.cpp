@@ -17,6 +17,7 @@
 #include <charconv>
 #include <fstream>
 #include <mutex>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -33,7 +34,7 @@ struct garnet_session {
   RClass* clip_class = nullptr;
   RClass* function_class = nullptr;
   void* call_context = nullptr;
-  std::recursive_mutex gate;
+  std::recursive_timed_mutex gate;
   bool active = false;
   unsigned depth = 0;
   bool poisoned = false;
@@ -636,9 +637,12 @@ garnet_result GARNET_CALL call_export(void* data, void* context, const garnet_va
   try {
     auto& entry = *static_cast<Export*>(data);
     auto& s = *entry.session;
-    std::unique_lock<std::recursive_mutex> lock(s.gate, std::try_to_lock);
-    if (!lock.owns_lock())
-      return error("Concurrent Ruby entry", GARNET_BUSY);
+    std::unique_lock<std::recursive_timed_mutex> lock(s.gate, std::defer_lock);
+    // A host call can synchronously wait for another worker that calls Ruby.
+    // Never turn that dependency into an unbounded VM-lock deadlock. Normal
+    // frame callbacks serialize; long contention fails without touching mruby.
+    if (!lock.try_lock_for(std::chrono::seconds(5)))
+      return error("Ruby callback wait exceeded 5 seconds (contention or cross-thread dependency)", GARNET_BUSY);
     if (s.poisoned)
       return error("Ruby session disabled after failed evaluation");
     if (count > 32767 || (count && !args))
@@ -689,12 +693,12 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
     return garnet::error("Unknown engine initialization error");
   }
 }
-static garnet_result evaluate(garnet_session* s, void* context, garnet_string source, garnet_string filename,
-                              bool file, bool pipeline = false) {
+static garnet_result evaluate(garnet_session* s, void* context, garnet_string source, garnet_string filename, bool file,
+                              bool pipeline = false) {
   if (!s || (!source.data && source.size))
     return garnet::error("Invalid evaluation input");
   try {
-    std::unique_lock<std::recursive_mutex> lock(s->gate, std::try_to_lock);
+    std::unique_lock<std::recursive_timed_mutex> lock(s->gate, std::try_to_lock);
     if (!lock.owns_lock() || (s->active && !file))
       return garnet::error("Concurrent or reentrant Ruby entry", GARNET_BUSY);
     if (s->poisoned)
