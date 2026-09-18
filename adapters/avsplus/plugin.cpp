@@ -28,6 +28,8 @@ struct Host {
   IScriptEnvironment* environment = nullptr;
   garnet_session* session = nullptr;
   std::vector<std::unique_ptr<Export>> exports;
+  std::mutex exports_gate;
+  std::unordered_set<std::string> export_names;
   std::vector<std::unique_ptr<Export>> functions;
   std::mutex functions_gate;
   ~Host() { garnet_destroy(session); }
@@ -316,7 +318,24 @@ garnet_result GARNET_CALL register_filter(void* identity, void* context, garnet_
       return error(("Exported filter name already exists: " + function).c_str());
     auto entry = std::make_unique<Export>(Export{&host, callback, data});
     auto* token = entry.get();
-    host.exports.push_back(std::move(entry));
+    auto folded = function;
+    for (auto& c : folded)
+      if (c >= 'A' && c <= 'Z')
+        c += 'a' - 'A';
+    {
+      // Reserve names across concurrent registrations, but never hold this
+      // lock across AVS calls: FunctionExists can trigger script autoload.
+      std::lock_guard<std::mutex> lock(host.exports_gate);
+      const auto inserted = host.export_names.insert(folded);
+      if (!inserted.second)
+        return error(("Exported filter name already exists: " + function).c_str());
+      try {
+        host.exports.push_back(std::move(entry));
+      } catch (...) {
+        host.export_names.erase(inserted.first);
+        throw;
+      }
+    }
     env->AddFunction(env->SaveString(function.c_str()), env->SaveString(params.c_str()), exported_filter, token);
     return {};
   } catch (const AvisynthError& e) {

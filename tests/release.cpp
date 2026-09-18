@@ -31,7 +31,6 @@ struct Host {
   void* data = nullptr;
   std::atomic<int> live{0}, released{0}, reentries{0};
   std::atomic<bool> reenter{true};
-  int expected_released = 0;
   std::mutex events;
   std::condition_variable event;
   void wait_for_reentries(int count) {
@@ -97,8 +96,7 @@ garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string na
   }
   if (filter == "Nested")
     return host.callback(host.data, &host, nullptr, 0);
-  CHECK(filter == "AssertNotReleased");
-  CHECK(host.released == host.expected_released);
+  CHECK(false);
   return {};
 }
 garnet_result GARNET_CALL register_filter(void* identity, void*, garnet_string, garnet_string, garnet_callback callback,
@@ -163,8 +161,8 @@ int main() {
   CHECK(host.live == 0 && host.reentries == 2);
 
   eval(host, "$clip = AVS.Source; nil");
-  host.expected_released = host.released;
-  eval(host, "$clip = nil; AVS.Nested; AVS.AssertNotReleased; nil");
+  // Cleanup may now run at a host boundary, before the outer evaluation ends.
+  eval(host, "$clip = nil; AVS.Nested; nil");
   host.wait_for_reentries(3);
   CHECK(host.live == 0 && host.reentries == 3);
 

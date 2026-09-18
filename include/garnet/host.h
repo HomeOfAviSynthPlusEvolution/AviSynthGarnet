@@ -15,8 +15,11 @@ extern "C" {
  * Destroy must not race with calls. Handles belong to exactly one host.
  * Owned handle/result release must be thread-safe: Ruby GC retires handles
  * for release on a dedicated native cleanup thread. Destroy joins cleanup
- * before returning. Retain/invoke still run on the original caller thread. */
-#define GARNET_CONTRACT_REVISION 6u
+ * before returning. Retain/invoke still run on the original caller thread.
+ * Invoke, registration and variable operations can overlap across invocations;
+ * their implementations must be thread-safe and may reenter via callbacks.
+ * Retain runs under VM ownership: it must not wait for or invoke Ruby. */
+#define GARNET_CONTRACT_REVISION 7u
 enum {
   GARNET_UNDEFINED,
   GARNET_BOOL,

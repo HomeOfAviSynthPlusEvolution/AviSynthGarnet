@@ -1,56 +1,92 @@
 #include <garnet/engine.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string_view>
 #include <thread>
 #include <vector>
 
-#define CHECK(condition)                                                                                               \
+#define CHECK(x)                                                                                                       \
   do {                                                                                                                 \
-    if (!(condition)) {                                                                                                \
-      std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition);                                                \
+    if (!(x)) {                                                                                                        \
+      std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x);                                                             \
       std::abort();                                                                                                    \
     }                                                                                                                  \
   } while (0)
 
 namespace {
-garnet_string str(const char* text) {
-  return {text, std::strlen(text)};
+garnet_string str(const char* value) {
+  return {value, std::strlen(value)};
 }
 void release(garnet_result r) {
   if (r.release)
     r.release(r.owner);
 }
+void check(garnet_result r, int expected) {
+  if (r.status != GARNET_OK)
+    std::fprintf(stderr, "%.*s\n", static_cast<int>(r.error.size), r.error.data);
+  CHECK(r.status == GARNET_OK && r.value.type == GARNET_INT && r.value.as.integer == expected);
+  release(r);
+}
 struct Host {
+  garnet_session* session = nullptr;
   garnet_callback callback = nullptr;
   void* data = nullptr;
+  std::mutex events;
+  std::condition_variable event;
+  bool a_parked = false, b_parked = false, release_b = false;
+};
+struct Context {
+  std::thread::id thread = std::this_thread::get_id();
+  int value = 0;
 };
 garnet_result call(Host& host, int mode) {
+  Context context;
   garnet_value arg{};
   arg.type = GARNET_INT;
   arg.as.integer = mode;
-  return host.callback(host.data, &host, &arg, 1);
+  return host.callback(host.data, &context, &arg, 1);
 }
-garnet_result GARNET_CALL invoke(void* identity, void*, garnet_string name, const garnet_value*, const garnet_string*,
-                                 size_t) {
+garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string name, const garnet_value*,
+                                 const garnet_string*, size_t) {
   auto& host = *static_cast<Host*>(identity);
-  if (std::string_view(name.data, name.size) == "CrossThread") {
-    // Outer Ruby holds the gate while the host waits synchronously on a worker.
-    // The worker must time out, not hang or enter the running mruby VM.
+  CHECK(static_cast<Context*>(context)->thread == std::this_thread::get_id());
+  const std::string_view filter(name.data, name.size);
+  if (filter == "CrossThread") {
+    // A waits synchronously for B, which needs the SAME Ruby VM. Previously
+    // B timed out after five seconds because A held the VM lock.
     std::thread worker([&] {
-      const auto start = std::chrono::steady_clock::now();
       auto r = call(host, 0);
-      CHECK(r.status == GARNET_BUSY);
-      CHECK(std::string_view(r.error.data, r.error.size).find("5 seconds") != std::string_view::npos);
-      CHECK(std::chrono::steady_clock::now() - start >= std::chrono::seconds(4));
+      CHECK(r.status == GARNET_OK && r.value.type == GARNET_INT);
       release(r);
     });
     worker.join();
+  } else if (filter == "SameThread") {
+    auto r = call(host, 0);
+    CHECK(r.status == GARNET_OK);
+    release(r);
+  } else if (filter == "Failure") {
+    garnet_result r{};
+    r.status = GARNET_ERROR;
+    r.error = str("native failure");
+    return r;
+  } else if (filter == "ParkA" || filter == "ParkB") {
+    std::unique_lock<std::mutex> lock(host.events);
+    if (filter == "ParkA") {
+      host.a_parked = true;
+      host.event.notify_all();
+      CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.b_parked; }));
+    } else {
+      host.b_parked = true;
+      host.event.notify_all();
+      CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.release_b; }));
+    }
   } else {
-    CHECK(std::string_view(name.data, name.size) == "Pause");
+    CHECK(filter == "Pause");
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   return {};
@@ -69,12 +105,18 @@ garnet_result GARNET_CALL register_filter(void* identity, void*, garnet_string, 
   host.data = data;
   return {};
 }
-garnet_result GARNET_CALL get(void*, void*, garnet_string) {
-  CHECK(false);
-  return {};
+garnet_result GARNET_CALL get(void*, void* context, garnet_string) {
+  auto& c = *static_cast<Context*>(context);
+  CHECK(c.thread == std::this_thread::get_id());
+  garnet_result r{};
+  r.value.type = GARNET_INT;
+  r.value.as.integer = c.value;
+  return r;
 }
-garnet_result GARNET_CALL set(void*, void*, garnet_string, const garnet_value*, int) {
-  CHECK(false);
+garnet_result GARNET_CALL set(void*, void* context, garnet_string, const garnet_value* value, int) {
+  auto& c = *static_cast<Context*>(context);
+  CHECK(c.thread == std::this_thread::get_id() && value->type == GARNET_INT);
+  c.value = static_cast<int>(value->as.integer);
   return {};
 }
 garnet_result GARNET_CALL invoke_function(void*, void*, void*, const garnet_value*, const garnet_string*, size_t) {
@@ -102,22 +144,70 @@ int main() {
                   free_handle,
                   invoke_function,
                   make_function};
-  garnet_session* session = nullptr;
-  auto r = garnet_create(&api, &session);
+  auto r = garnet_create(&api, &host.session);
   CHECK(r.status == GARNET_OK);
   release(r);
-  r = garnet_evaluate(session, &host,
-                      str("counter = 0\n"
-                          "AVS.export('Count', 'i') do |mode|\n"
-                          "  if mode == 2\n"
-                          "    AVS.CrossThread\n"
-                          "  elsif mode == 1\n"
-                          "    AVS.Pause\n"
-                          "  end\n"
-                          "  counter += 1\n"
-                          "end\n"
-                          "nil\n"),
+  Context context;
+  r = garnet_evaluate(host.session, &context, str(R"RUBY(
+counter = 0
+shared = []
+AVS.export('Count', 'i') do |mode|
+  AVS[:local] = mode
+  if mode == 0
+    shared << 'nested'
+    GC.start
+  elsif mode == 1
+    AVS.Pause
+  elsif mode == 2
+    AVS.CrossThread
+  elsif mode == 3
+    original = shared
+    AVS.SameThread
+    raise 'identity lost' unless original.equal?(shared) && shared[-1] == 'nested'
+    a = [3,1,2].sort { |x,y| AVS.CrossThread; x <=> y }
+    raise 'sort' unless a == [1,2,3]
+    a = Array.new(3) { |i| AVS.CrossThread; "item#{i}" }
+    raise 'Array.new' unless a == ['item0','item1','item2']
+    h = Hash.new { |hash,key| AVS.CrossThread; hash[key] = 'default' }
+    raise 'Hash default' unless h[:key] == 'default'
+    raise 'index' unless a.index { |v| AVS.CrossThread; v == 'item1' } == 1
+    begin
+      begin
+        raise 'pending Ruby error'
+      ensure
+        AVS.CrossThread
+      end
+    rescue => e
+      raise 'lost pending exception' unless e.message == 'pending Ruby error'
+    end
+    begin
+      AVS.Failure
+      raise 'missing native error'
+    rescue => e
+      raise 'native error' unless e.message == 'native failure'
+    ensure
+      AVS.CrossThread
+    end
+    GC.start
+    raise 'call context changed' unless AVS[:local] == mode
+    next 42
+  elsif mode == 4 || mode == 5
+    # A and B both park, then A exits and frees its arena BEFORE B resumes.
+    a = Array.new(3) { |i| "#{mode}-#{i}" }
+    mode == 4 ? AVS.ParkA : AVS.ParkB
+    GC.start
+    raise 'lost parked roots' unless a == ["#{mode}-0", "#{mode}-1", "#{mode}-2"]
+    raise 'call context changed' unless AVS[:local] == mode
+    next mode
+  end
+  raise 'call context changed' unless AVS[:local] == mode
+  counter += 1
+end
+nil
+)RUBY"),
                       str("concurrency.avs.rb"));
+  if (r.status != GARNET_OK)
+    std::fprintf(stderr, "%.*s\n", static_cast<int>(r.error.size), r.error.data);
   CHECK(r.status == GARNET_OK && host.callback);
   release(r);
   std::atomic<int> ready{0};
@@ -139,12 +229,30 @@ int main() {
   start = true;
   for (auto& worker : workers)
     worker.join();
-  r = call(host, 2);
-  CHECK(r.status == GARNET_OK && r.value.as.integer == 101);
+  check(call(host, 2), 102);
+  check(call(host, 0), 103);
+  check(call(host, 3), 42);
+  std::thread a([&] { check(call(host, 4), 4); });
+  {
+    std::unique_lock<std::mutex> lock(host.events);
+    CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.a_parked; }));
+  }
+  std::thread b([&] { check(call(host, 5), 5); });
+  a.join();
+  // Evaluation must be rejected even when the VM is temporarily idle.
+  r = garnet_evaluate(host.session, &context, str("42"), str("busy.rb"));
+  CHECK(r.status == GARNET_BUSY);
   release(r);
-  // A rejected concurrent entry must not poison the owner or later callbacks.
-  r = call(host, 0);
-  CHECK(r.status == GARNET_OK && r.value.as.integer == 102);
+  r = call(host, 0); // GC while B owns a suspended invocation's arena.
+  CHECK(r.status == GARNET_OK);
   release(r);
-  garnet_destroy(session);
+  {
+    std::lock_guard<std::mutex> lock(host.events);
+    host.release_b = true;
+  }
+  host.event.notify_all();
+  b.join();
+  garnet_destroy(host.session);
+  std::puts("PASS host handoff, original thread/context, GC, C blocks, exceptions and non-LIFO completion");
+  return 0;
 }

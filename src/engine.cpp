@@ -1,6 +1,7 @@
 #include <garnet/engine.h>
 #include "result.hpp"
 #include "runtime.hpp"
+#include "execution.hpp"
 #include <mruby.h>
 #include <mruby/array.h>
 #include <mruby/class.h>
@@ -39,10 +40,9 @@ struct garnet_session {
   mrb_state* ruby = nullptr;
   RClass* clip_class = nullptr;
   RClass* function_class = nullptr;
-  void* call_context = nullptr;
   std::recursive_timed_mutex gate;
-  bool active = false;
-  unsigned depth = 0;
+  garnet::Execution execution;
+  std::condition_variable_any idle;
   bool poisoned = false;
   bool import_failed = false;
   std::unordered_map<std::string, mrb_value> loaded;
@@ -50,14 +50,24 @@ struct garnet_session {
   std::vector<std::unique_ptr<Export>> exports;
   RetiredHandle* retired = nullptr;
   bool stopping = false;
-  std::condition_variable_any release_ready;
+  std::mutex release_gate;
+  std::condition_variable release_ready;
   std::thread releaser;
   void retire(RetiredHandle* handle) noexcept {
-    // Called by mruby's collector with exclusive VM ownership (or at close).
-    // Intrusive linking cannot allocate, block, or call back into the host.
+    // Intrusive linking cannot allocate or call back into the host. The queue
+    // mutex is never held during destruction or while acquiring VM ownership.
     if (handle) {
-      handle->next = retired;
-      retired = handle;
+      bool wake = false;
+      {
+        std::lock_guard<std::mutex> lock(release_gate);
+        wake = retired == nullptr;
+        handle->next = retired;
+        retired = handle;
+      }
+      // A long script must not retain every native argument/result until its
+      // outermost invocation returns. Notify only on an empty-to-ready edge.
+      if (wake)
+        release_ready.notify_one();
     }
   }
   static void release_batch(RetiredHandle* batch) noexcept {
@@ -68,7 +78,7 @@ struct garnet_session {
     }
   }
   void release_loop() noexcept {
-    std::unique_lock<std::recursive_timed_mutex> lock(gate);
+    std::unique_lock<std::mutex> lock(release_gate);
     for (;;) {
       release_ready.wait(lock, [&] { return retired || stopping; });
       auto* batch = retired;
@@ -88,12 +98,16 @@ struct garnet_session {
       // Ruby roots can retain a Prefetch graph after the caller drops its copy.
       // Its workers can still be in a callback when AVS runs AtExit. Wait for
       // the VM, reject subsequent entries, and enqueue all remaining handles.
-      std::lock_guard<std::recursive_timed_mutex> lock(gate);
+      std::unique_lock<std::recursive_timed_mutex> lock(gate);
       poisoned = true;
+      idle.wait(lock, [&] { return execution.calls.empty(); });
       if (ruby) {
         mrb_close(ruby);
         ruby = nullptr;
       }
+    }
+    {
+      std::lock_guard<std::mutex> lock(release_gate);
       stopping = true;
     }
     // Keep callback tokens and host state alive until the cleanup thread has
@@ -109,8 +123,34 @@ namespace {
 using namespace garnet;
 struct WakeReleaser {
   garnet_session& session;
-  ~WakeReleaser() { session.release_ready.notify_one(); }
+  ~WakeReleaser() {
+    session.release_ready.notify_one();
+    session.idle.notify_all();
+  }
 };
+struct Retire {
+  garnet_session& session;
+  void operator()(RetiredHandle* p) const noexcept { session.retire(p); }
+};
+struct HostResult : RetiredHandle {
+  ResultGuard result{{}};
+};
+struct HostArguments : RetiredHandle {
+  std::vector<std::unique_ptr<Storage>> values;
+};
+template <typename Call>
+auto host_call(garnet_session& s, Call&& call) {
+  // Allocate ownership before leaving the VM, including for error results.
+  std::unique_ptr<HostResult, Retire> result(new HostResult, Retire{s});
+  auto* invocation = s.execution.current;
+  assert(invocation);
+  auto* context = invocation->call_context;
+  {
+    OutsideVM outside(*invocation);
+    result->result.value = call(context);
+  }
+  return result;
+}
 mrb_value load_file(mrb_state*, const std::string&, bool*, bool = true);
 std::filesystem::path relative_script_path(mrb_state* mrb, const char* name) {
   auto path = std::filesystem::u8path(name);
@@ -364,8 +404,10 @@ mrb_value export_filter(mrb_state* mrb, mrb_value) {
     // Keep the callback alive even if a host reports failure after registration.
     auto* data = entry.get();
     s.exports.push_back(std::move(entry));
-    ResultGuard r(
-        s.host.register_filter(s.host.identity, s.call_context, span(function), span(params), call_export, data));
+    auto owner = host_call(s, [&](void* context) {
+      return s.host.register_filter(s.host.identity, context, span(function), span(params), call_export, data);
+    });
+    auto& r = owner->result;
     r.check();
     return mrb_nil_value();
   } catch (const std::exception& e) {
@@ -389,7 +431,10 @@ mrb_value make_function(mrb_state* mrb, mrb_value) {
     mrb_gc_register(mrb, block);
     auto* data = entry.get();
     s.exports.push_back(std::move(entry));
-    ResultGuard r(s.host.make_function(s.host.identity, s.call_context, span(params), call_export, data));
+    auto owner = host_call(s, [&](void* context) {
+      return s.host.make_function(s.host.identity, context, span(params), call_export, data);
+    });
+    auto& r = owner->result;
     r.check();
     if (r.value.value.type != GARNET_FUNCTION)
       throw std::runtime_error("Host did not create a function");
@@ -410,7 +455,9 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "Native filter blocks are not yet supported");
   try {
     const auto name = function_call ? std::string() : name_of(mrb, values[0]);
-    std::vector<std::unique_ptr<Storage>> owned;
+    auto& s = session(mrb);
+    std::unique_ptr<HostArguments, Retire> arguments(new HostArguments, Retire{s});
+    auto& owned = arguments->values;
     std::vector<std::string> names;
     if (mrb_data_p(self) && DATA_TYPE(self) == &clip_type)
       owned.push_back(from_ruby(mrb, self));
@@ -442,13 +489,14 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
     std::vector<garnet_string> arg_names(positional);
     for (const auto& n : names)
       arg_names.push_back(span(n));
-    auto& s = session(mrb);
     auto* function = function_call ? static_cast<Function*>(DATA_PTR(self)) : nullptr;
-    ResultGuard r(
-        function
-            ? s.host.invoke_function(s.host.identity, s.call_context, function->retained.value.value.as.handle,
-                                     args.data(), arg_names.data(), args.size())
-            : s.host.invoke(s.host.identity, s.call_context, span(name), args.data(), arg_names.data(), args.size()));
+    auto* handle = function ? function->retained.value.value.as.handle : nullptr;
+    auto owner = host_call(s, [&](void* context) {
+      return function
+                 ? s.host.invoke_function(s.host.identity, context, handle, args.data(), arg_names.data(), args.size())
+                 : s.host.invoke(s.host.identity, context, span(name), args.data(), arg_names.data(), args.size());
+    });
+    auto& r = owner->result;
     r.check();
     return to_ruby(mrb, r.value.value);
   } catch (const std::exception& e) {
@@ -461,7 +509,8 @@ mrb_value get_var(mrb_state* mrb, mrb_value) {
   try {
     const auto name = name_of(mrb, key);
     auto& s = session(mrb);
-    ResultGuard r(s.host.get_var(s.host.identity, s.call_context, span(name)));
+    auto owner = host_call(s, [&](void* context) { return s.host.get_var(s.host.identity, context, span(name)); });
+    auto& r = owner->result;
     r.check();
     return r.value.value.type == GARNET_UNDEFINED ? fallback : to_ruby(mrb, r.value.value);
   } catch (const std::exception& e) {
@@ -473,9 +522,13 @@ mrb_value assign_var(mrb_state* mrb, bool global) {
   mrb_get_args(mrb, "oo", &key, &value);
   try {
     const auto name = name_of(mrb, key);
-    auto owned = from_ruby(mrb, value);
     auto& s = session(mrb);
-    ResultGuard r(s.host.set_var(s.host.identity, s.call_context, span(name), &owned->value, global));
+    std::unique_ptr<HostArguments, Retire> arguments(new HostArguments, Retire{s});
+    arguments->values.push_back(from_ruby(mrb, value));
+    auto owner = host_call(s, [&](void* context) {
+      return s.host.set_var(s.host.identity, context, span(name), &arguments->values[0]->value, global);
+    });
+    auto& r = owner->result;
     r.check();
     return value;
   } catch (const std::exception& e) {
@@ -629,24 +682,13 @@ mrb_value evaluate_body(mrb_state* mrb, void* data) {
 }
 struct Active {
   garnet_session& s;
-  int arena;
-  void* previous_context;
-  bool previous_active;
+  Invocation invocation;
   bool done = false;
-  Active(garnet_session& session, void* context)
-      : s(session), arena(mrb_gc_arena_save(s.ruby)), previous_context(s.call_context), previous_active(s.active) {
-    s.call_context = context;
-    s.active = true;
-    ++s.depth;
-  }
+  Active(garnet_session& session, std::unique_lock<std::recursive_timed_mutex>& lock, void* context)
+      : s(session), invocation(s.execution, lock, context) {}
   ~Active() {
     if (!done)
       s.poisoned = true;
-    s.call_context = previous_context;
-    s.ruby->exc = nullptr;
-    s.active = previous_active;
-    --s.depth;
-    mrb_gc_arena_restore(s.ruby, arena);
   }
 };
 struct CallbackCall {
@@ -701,18 +743,19 @@ garnet_result GARNET_CALL call_export(void* data, void* context, const garnet_va
     auto& s = *entry.session;
     WakeReleaser wake{s}; // Destroyed after the lock and Active scope.
     std::unique_lock<std::recursive_timed_mutex> lock(s.gate, std::defer_lock);
-    // A host call can synchronously wait for another worker that calls Ruby.
-    // Never turn that dependency into an unbounded VM-lock deadlock. Normal
-    // frame callbacks serialize; long contention fails without touching mruby.
+    // Ruby itself remains serialized. Host calls temporarily relinquish VM
+    // ownership, so another worker can satisfy a synchronous frame dependency.
     if (!lock.try_lock_for(std::chrono::seconds(5)))
       return error("Ruby callback wait exceeded 5 seconds (contention or cross-thread dependency)", GARNET_BUSY);
     if (s.poisoned)
       return error("Ruby session disabled after failed evaluation");
     if (count > 32767 || (count && !args))
       return error("Invalid callback arguments");
-    if (s.depth >= 64)
+    if (s.execution.current)
+      return error("Reentrant host retain is not supported", GARNET_BUSY);
+    if (auto* parent = Invocation::parent(s.execution); parent && parent->depth >= 64)
       return error("Ruby callback nesting limit exceeded");
-    Active active(s, context);
+    Active active(s, lock, context);
     CallbackCall call{entry, args, count, nullptr};
     mrb_bool failed = false;
     auto value = mrb_protect_error(s.ruby, callback_body, &call, &failed);
@@ -748,6 +791,9 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
     mrb_bool failed = false;
     auto r = mrb_protect_error(s->ruby, setup, nullptr, &failed);
     check_ruby(s->ruby, failed, r);
+    if (mrb_class_defined(s->ruby, "Fiber"))
+      throw std::runtime_error("Garnet requires mruby without the Fiber gem");
+    s->execution.ruby = s->ruby;
     s->releaser = std::thread([session = s.get()] { session->release_loop(); });
     *out = s.release();
     return {};
@@ -764,16 +810,17 @@ static garnet_result evaluate(garnet_session* s, void* context, garnet_string so
   try {
     WakeReleaser wake{*s}; // Host resources are released after VM ownership.
     std::unique_lock<std::recursive_timed_mutex> lock(s->gate, std::try_to_lock);
-    if (!lock.owns_lock() || (s->active && !file))
+    if (!lock.owns_lock() || s->execution.current ||
+        (!s->execution.calls.empty() && (!file || !Invocation::parent(s->execution))))
       return garnet::error("Concurrent or reentrant Ruby entry", GARNET_BUSY);
     if (s->poisoned)
       return garnet::error("Ruby session disabled after failed evaluation");
-    if (s->depth >= 64)
+    if (auto* parent = Invocation::parent(s->execution); parent && parent->depth >= 64)
       return garnet::error("Ruby script nesting limit exceeded");
     Evaluation e{source, garnet::text(filename), nullptr, file, pipeline};
     if (e.filename.find('\0') != std::string::npos)
       return garnet::error("NUL in filename");
-    Active active(*s, context);
+    Active active(*s, lock, context);
     mrb_bool failed = false;
     auto value = mrb_protect_error(s->ruby, evaluate_body, &e, &failed);
     check_ruby(s->ruby, failed, value);
