@@ -313,6 +313,11 @@ int main(int argc, char** argv) {
   garnet_destroy(s);
   CHECK(host.clips == 0);
   failure("AVS.Echo(Width: 1, width: 2)", "Duplicate");
+  failure("AVS.call(\"Echo\\0other\".to_sym, 1)", "NUL in name");
+  failure("AVS.get_var(\"value\\0other\".to_sym)", "NUL in name");
+  failure("AVS.set_var(\"value\\0other\".to_sym, 1)", "NUL in name");
+  failure("AVS.Echo(**{\"width\\0other\".to_sym => 1})", "NUL in name");
+  failure("AVS.export(\"Twice\\0other\".to_sym, 'i') {}", "NUL in name");
   failure("AVS.Echo(9223372036854775808)", "RangeError");
   failure("AVS.Echo(-9223372036854775809)", "RangeError");
   failure("a = []; a << a; a", "nesting");

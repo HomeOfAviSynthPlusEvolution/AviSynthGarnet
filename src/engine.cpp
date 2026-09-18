@@ -236,8 +236,14 @@ mrb_value to_ruby(mrb_state* mrb, const garnet_value& value, int depth = 0) {
   }
 }
 std::string name_of(mrb_state* mrb, mrb_value value) {
-  if (mrb_symbol_p(value))
-    return mrb_sym_name(mrb, mrb_symbol(value));
+  if (mrb_symbol_p(value)) {
+    mrb_int length = 0;
+    const auto* data = mrb_sym_name_len(mrb, mrb_symbol(value), &length);
+    const std::string name(data, static_cast<size_t>(length));
+    if (name.find('\0') != std::string::npos)
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "NUL in name");
+    return name;
+  }
   return mrb_string_cstr(mrb, value);
 }
 std::string fold(std::string s) {
