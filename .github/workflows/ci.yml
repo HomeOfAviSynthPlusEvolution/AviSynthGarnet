@@ -25,10 +25,12 @@ jobs:
             os: windows-2022
             cc: cl
             cxx: cl
+            artifact: Garnet-windows-x64-msvc
           - name: Windows x64 / clang-cl
             os: windows-2022
             cc: clang-cl
             cxx: clang-cl
+            artifact: Garnet-windows-x64-clang-cl
           - name: Linux x64 / GCC
             os: ubuntu-24.04
             cc: gcc
@@ -144,3 +146,11 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build/ci --output-on-failure --no-tests=error --parallel 4 --timeout 120
+
+      - name: Upload Windows DLL
+        if: success() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/ci/Garnet.dll
+          if-no-files-found: error
