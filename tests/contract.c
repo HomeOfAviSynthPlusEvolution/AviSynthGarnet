@@ -2,6 +2,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG clip_count;
+static void add_clips(clip_count* count, int change) {
+  InterlockedExchangeAdd(count, change);
+}
+#else
+typedef int clip_count;
+static void add_clips(clip_count* count, int change) {
+  __atomic_fetch_add(count, change, __ATOMIC_RELAXED);
+}
+#endif
 
 #define CHECK(c)                                                                                                       \
   do {                                                                                                                 \
@@ -12,7 +24,7 @@
   } while (0)
 typedef struct fake_host {
   int calls;
-  int clips;
+  clip_count clips;
   int context;
   garnet_session* session;
   garnet_callback callback;
@@ -34,7 +46,7 @@ static void release_result(garnet_result r) {
 }
 static void GARNET_CALL free_clip(void* identity, void* p) {
   fake_host* host = (fake_host*)identity;
-  --host->clips;
+  add_clips(&host->clips, -1);
   free(p);
 }
 static void GARNET_CALL free_clip_result(void* p) {
@@ -48,7 +60,7 @@ static garnet_result clip_result(fake_host* host) {
   clip->host = host;
   clip->callback = NULL;
   clip->callback_data = NULL;
-  ++host->clips;
+  add_clips(&host->clips, 1);
   r.value.type = GARNET_CLIP;
   r.value.as.handle = clip;
   r.owner = clip;

@@ -12,8 +12,11 @@ extern "C" {
 #endif
 /* Private exact-match contract, not a stable public ABI. No exceptions may
  * cross it. Inputs are borrowed. Release results before destroying the host.
- * Destroy must not race with calls. Handles belong to exactly one host. */
-#define GARNET_CONTRACT_REVISION 5u
+ * Destroy must not race with calls. Handles belong to exactly one host.
+ * Owned handle/result release must be thread-safe: Ruby GC retires handles
+ * for release on a dedicated native cleanup thread. Destroy joins cleanup
+ * before returning. Retain/invoke still run on the original caller thread. */
+#define GARNET_CONTRACT_REVISION 6u
 enum {
   GARNET_UNDEFINED,
   GARNET_BOOL,

@@ -18,6 +18,8 @@
 #include <fstream>
 #include <mutex>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -27,6 +29,10 @@ struct Export {
   garnet_session* session;
   mrb_value block;
   char returns = '.';
+};
+struct RetiredHandle {
+  RetiredHandle* next = nullptr;
+  virtual ~RetiredHandle() = default;
 };
 struct garnet_session {
   garnet_host host{};
@@ -42,13 +48,69 @@ struct garnet_session {
   std::unordered_map<std::string, mrb_value> loaded;
   std::unordered_set<std::string> loading;
   std::vector<std::unique_ptr<Export>> exports;
+  RetiredHandle* retired = nullptr;
+  bool stopping = false;
+  std::condition_variable_any release_ready;
+  std::thread releaser;
+  void retire(RetiredHandle* handle) noexcept {
+    // Called by mruby's collector with exclusive VM ownership (or at close).
+    // Intrusive linking cannot allocate, block, or call back into the host.
+    if (handle) {
+      handle->next = retired;
+      retired = handle;
+    }
+  }
+  static void release_batch(RetiredHandle* batch) noexcept {
+    while (batch) {
+      auto* next = batch->next;
+      delete batch;
+      batch = next;
+    }
+  }
+  void release_loop() noexcept {
+    std::unique_lock<std::recursive_timed_mutex> lock(gate);
+    for (;;) {
+      release_ready.wait(lock, [&] { return retired || stopping; });
+      auto* batch = retired;
+      retired = nullptr;
+      if (!batch && stopping)
+        return;
+      lock.unlock();
+      // Never destroy a Prefetch graph on one of its own frame workers: its
+      // destructor may join those workers. The loop itself makes no mruby calls;
+      // host destructors can reenter through the normal guarded engine API.
+      release_batch(batch);
+      lock.lock();
+    }
+  }
   ~garnet_session() {
-    if (ruby)
-      mrb_close(ruby);
+    {
+      // Ruby roots can retain a Prefetch graph after the caller drops its copy.
+      // Its workers can still be in a callback when AVS runs AtExit. Wait for
+      // the VM, reject subsequent entries, and enqueue all remaining handles.
+      std::lock_guard<std::recursive_timed_mutex> lock(gate);
+      poisoned = true;
+      if (ruby) {
+        mrb_close(ruby);
+        ruby = nullptr;
+      }
+      stopping = true;
+    }
+    // Keep callback tokens and host state alive until the cleanup thread has
+    // released every batch and native destructors have joined their workers.
+    release_ready.notify_all();
+    if (releaser.joinable())
+      releaser.join();
+    else
+      release_batch(retired); // Initialization failed before the worker started.
   }
 };
 namespace {
 using namespace garnet;
+struct WakeReleaser {
+  garnet_session& session;
+  ~WakeReleaser() { session.release_ready.notify_one(); }
+};
 mrb_value load_file(mrb_state*, const std::string&, bool*, bool = true);
 std::filesystem::path relative_script_path(mrb_state* mrb, const char* name) {
   auto path = std::filesystem::u8path(name);
@@ -108,7 +170,7 @@ mrb_value require_relative(mrb_state* mrb, mrb_value) {
 garnet_session& session(mrb_state* mrb) {
   return *static_cast<garnet_session*>(mrb->ud);
 }
-struct Clip {
+struct Clip : RetiredHandle {
   void* identity;
   ResultGuard retained;
   Clip(const garnet_host& host, void* handle)
@@ -118,11 +180,11 @@ struct Clip {
       throw std::runtime_error("Invalid retained clip");
   }
 };
-void free_clip(mrb_state*, void* p) {
-  delete static_cast<Clip*>(p);
+void free_clip(mrb_state* mrb, void* p) {
+  session(mrb).retire(static_cast<Clip*>(p));
 }
 const mrb_data_type clip_type{"AVS::Clip", free_clip};
-struct Function {
+struct Function : RetiredHandle {
   void* identity;
   ResultGuard retained;
   Function(const garnet_host& host, void* handle)
@@ -132,8 +194,8 @@ struct Function {
       throw std::runtime_error("Invalid retained function");
   }
 };
-void free_function(mrb_state*, void* p) {
-  delete static_cast<Function*>(p);
+void free_function(mrb_state* mrb, void* p) {
+  session(mrb).retire(static_cast<Function*>(p));
 }
 const mrb_data_type function_type{"AVS::Function", free_function};
 
@@ -637,6 +699,7 @@ garnet_result GARNET_CALL call_export(void* data, void* context, const garnet_va
   try {
     auto& entry = *static_cast<Export*>(data);
     auto& s = *entry.session;
+    WakeReleaser wake{s}; // Destroyed after the lock and Active scope.
     std::unique_lock<std::recursive_timed_mutex> lock(s.gate, std::defer_lock);
     // A host call can synchronously wait for another worker that calls Ruby.
     // Never turn that dependency into an unbounded VM-lock deadlock. Normal
@@ -685,6 +748,7 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
     mrb_bool failed = false;
     auto r = mrb_protect_error(s->ruby, setup, nullptr, &failed);
     check_ruby(s->ruby, failed, r);
+    s->releaser = std::thread([session = s.get()] { session->release_loop(); });
     *out = s.release();
     return {};
   } catch (const std::exception& e) {
@@ -698,6 +762,7 @@ static garnet_result evaluate(garnet_session* s, void* context, garnet_string so
   if (!s || (!source.data && source.size))
     return garnet::error("Invalid evaluation input");
   try {
+    WakeReleaser wake{*s}; // Host resources are released after VM ownership.
     std::unique_lock<std::recursive_timed_mutex> lock(s->gate, std::try_to_lock);
     if (!lock.owns_lock() || (s->active && !file))
       return garnet::error("Concurrent or reentrant Ruby entry", GARNET_BUSY);
