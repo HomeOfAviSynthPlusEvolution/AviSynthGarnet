@@ -190,18 +190,27 @@ static garnet_session* create(fake_host* host) {
 static garnet_result eval(fake_host* host, const char* code) {
   return garnet_evaluate(host->session, &host->context, str(code), str("contract.avs.rb"));
 }
-static void failure(const char* code, const char* expected) {
+static void failure_one_of(const char* code, const char* expected, const char* alternative) {
   fake_host host = {0};
   garnet_session* s = create(&host);
   garnet_result r = eval(&host, code);
+  const int matches = r.error.data &&
+      (strstr(r.error.data, expected) || (alternative && strstr(r.error.data, alternative)));
+  if (r.status == GARNET_OK || !matches)
+    fprintf(stderr, "Ruby: %s\nExpected error: %s%s%s\nActual (%d): %.*s\n", code, expected,
+            alternative ? " OR " : "", alternative ? alternative : "",
+            (int)r.status, (int)r.error.size, r.error.data ? r.error.data : "");
   CHECK(r.status != GARNET_OK);
-  CHECK(r.error.data && strstr(r.error.data, expected));
+  CHECK(matches);
   release_result(r);
   r = eval(&host, "1");
   CHECK(r.status != GARNET_OK);
   release_result(r);
   garnet_destroy(s);
   CHECK(host.clips == 0);
+}
+static void failure(const char* code, const char* expected) {
+  failure_one_of(code, expected, NULL);
 }
 int main(int argc, char** argv) {
   fake_host host = {0};
@@ -316,7 +325,10 @@ int main(int argc, char** argv) {
   failure("AVS.__function('[__garnet_token]i', 'i') {}", "Invalid or duplicate");
   failure("AVS.export(:Twice, 'i') {} ; AVS.export(:Twice, 'i') {}", "duplicate export");
   failure("AVS.export(:Twice, 'i') { raise 'callback failed' }; AVS.Twice(1)", "callback failed");
-  failure("AVS.export(:Twice, 'i') { |x| AVS.Twice(x) }; AVS.Twice(1)", "nesting limit");
+  // mruby lowers its call limit from 512 to 128 under ASan. Either it or
+  // Garnet can reject recursion first; both must leave the session disabled.
+  failure_one_of("AVS.export(:Twice, 'i') { |x| AVS.Twice(x) }; AVS.Twice(1)",
+                 "Ruby callback nesting limit exceeded", "SystemStackError: stack level too deep");
   failure("AVS.export(:Twice, '[Width]i[width]i') {}", "duplicate");
   failure("AVS.filter(:Twice, args: {value: :unknown}) {}", "unknown AVS type");
   CHECK(argc == 2);
