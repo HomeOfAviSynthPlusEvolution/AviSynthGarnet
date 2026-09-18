@@ -5,8 +5,25 @@ module AVS
   # Native signatures remain available through export; library authors normally
   # only need a readable schema and a block (or a block delegating to a class).
   def self.filter(name, args: {}, options: {}, &body)
-    raise ArgumentError, 'AVS.filter requires a block' unless body
+    signature, wrapper = __schema(args, options, body)
+    export(name, signature, &wrapper)
+  end
+
+  def self.function(args: {}, options: {}, returns: :any, &body)
+    signature, wrapper = __schema(args, options, body)
+    code = __type(returns)
+    __function(signature, code, &wrapper)
+  end
+
+  def self.__type(type)
     types = {clip: 'c', bool: 'b', int: 'i', float: 'f', string: 's', func: 'n', any: '.'}
+    code = types[type]
+    raise ArgumentError, "unknown AVS type #{type}" unless code
+    code
+  end
+
+  def self.__schema(args, options, body)
+    raise ArgumentError, 'a block is required' unless body
     seen = {}
     signature = ''
     [args, options].each_with_index do |schema, kind|
@@ -16,8 +33,7 @@ module AVS
         canonical = text.downcase
         raise ArgumentError, "duplicate parameter #{text}" if seen[canonical]
         seen[canonical] = true
-        code = types[type]
-        raise ArgumentError, "unknown AVS type #{type}" unless code
+        code = __type(type)
         signature += kind == 0 ? code : "[#{text}]#{code}"
       end
     end
@@ -25,7 +41,7 @@ module AVS
     # dispatch while the host still uses the original signature.
     names = options.keys.map { |key| key.to_s.to_sym }
     required = args.size
-    export(name, signature) do |*values|
+    wrapper = ->(*values) do
       keywords = {}
       names.each_with_index do |key, i|
         value = values[required + i]
@@ -33,5 +49,6 @@ module AVS
       end
       body.call(*values[0, required], **keywords)
     end
+    [signature, wrapper]
   end
 end

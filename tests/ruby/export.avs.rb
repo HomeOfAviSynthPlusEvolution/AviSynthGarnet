@@ -1,4 +1,16 @@
 require_relative 'lib/filters'
+factor = 2
+rubyfn = AVS.function(args: {x: :int}, options: {offset: :int}, returns: :int) do |x, offset: 0|
+  x * factor + offset
+end
+raise 'Ruby-created function' unless rubyfn.call(20, OFFSET: 2) == 42
+AVS[:ruby_created_lambda] = rubyfn
+AVS[:ruby_zero_lambda] = AVS.function(returns: :int) { 42 }
+echo = AVS.function(options: {value: :any}) { |value: nil| value }
+raise 'nested function argument array' unless echo.call(value: [[1, 2], [3, 4]]) == [[1, 2], [3, 4]]
+raise 'undefined optional argument' unless echo.call.nil?
+raise 'false optional argument' unless echo.call(value: false) == false
+GC.start
 fn = AVS[:avs_lambda]
 raise 'function call' unless fn.call(21) == 42
 raise 'named function call' unless AVS[:avs_named_lambda].call(VaLuE: 21) == 42

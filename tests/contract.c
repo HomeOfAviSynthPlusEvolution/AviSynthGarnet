@@ -21,6 +21,8 @@ typedef struct fake_host {
 } fake_host;
 typedef struct fake_clip {
   fake_host* host;
+  garnet_callback callback;
+  void* callback_data;
 } fake_clip;
 static garnet_string str(const char* s) {
   garnet_string v = {s, strlen(s)};
@@ -44,6 +46,8 @@ static garnet_result clip_result(fake_host* host) {
   fake_clip* clip = (fake_clip*)malloc(sizeof(fake_clip));
   CHECK(clip);
   clip->host = host;
+  clip->callback = NULL;
+  clip->callback_data = NULL;
   ++host->clips;
   r.value.type = GARNET_CLIP;
   r.value.as.handle = clip;
@@ -52,8 +56,11 @@ static garnet_result clip_result(fake_host* host) {
   return r;
 }
 static garnet_result GARNET_CALL retain(void* identity, void* handle) {
+  garnet_result r;
   CHECK(((fake_clip*)handle)->host == identity);
-  return clip_result((fake_host*)identity);
+  r = clip_result((fake_host*)identity);
+  *(fake_clip*)r.value.as.handle = *(fake_clip*)handle;
+  return r;
 }
 static int equal(garnet_string a, const char* b) {
   return a.size == strlen(b) && !memcmp(a.data, b, a.size);
@@ -138,9 +145,21 @@ static garnet_result GARNET_CALL invoke_function(void* identity, void* context, 
   fake_host* host = (fake_host*)identity;
   garnet_result r = {0};
   CHECK(((fake_clip*)handle)->host == host && context == &host->context);
+  if (((fake_clip*)handle)->callback)
+    return ((fake_clip*)handle)->callback(((fake_clip*)handle)->callback_data, context, args, count);
   CHECK(count == 1 && args[0].type == GARNET_INT && names[0].size == 0);
   r.value.type = GARNET_INT;
   r.value.as.integer = args[0].as.integer * 2;
+  return r;
+}
+static garnet_result GARNET_CALL make_function(void* identity, void* context, garnet_string signature,
+                                               garnet_callback callback, void* data) {
+  fake_host* host = (fake_host*)identity;
+  garnet_result r = clip_result(host);
+  CHECK(context == &host->context && equal(signature, "i"));
+  r.value.type = GARNET_FUNCTION;
+  ((fake_clip*)r.value.as.handle)->callback = callback;
+  ((fake_clip*)r.value.as.handle)->callback_data = data;
   return r;
 }
 static garnet_host api(fake_host* host) {
@@ -155,7 +174,8 @@ static garnet_host api(fake_host* host) {
                         set_var,
                         retain_function,
                         free_clip,
-                        invoke_function};
+                        invoke_function,
+                        make_function};
   return result;
 }
 static garnet_session* create(fake_host* host) {
@@ -224,6 +244,12 @@ int main(int argc, char** argv) {
   r = eval(&host, "AVS.Reenter");
   CHECK(r.status == GARNET_OK);
   release_result(r);
+  r = eval(&host, "factor = 2; $rubyfn = AVS.function(args: {x: :int}, returns: :int) { |x| x * factor }; GC.start; "
+                  "$rubyfn.call(21)");
+  if (r.status != GARNET_OK)
+    fprintf(stderr, "%.*s\n", (int)r.error.size, r.error.data);
+  CHECK(r.status == GARNET_OK && r.value.as.integer == 42);
+  release_result(r);
   r = eval(&host, "$fn = AVS.Lambda; GC.start; $fn.call(21)");
   CHECK(r.status == GARNET_OK && r.value.as.integer == 42);
   release_result(r);
@@ -263,6 +289,8 @@ int main(int argc, char** argv) {
   failure("def broken(", "syntax");
   failure("AVS.Missing", "unknown filter");
   failure("{}", "Expected");
+  failure("AVS.function(args: {x: :int}, returns: :int) { |x| 'wrong' }.call(1)", "return type mismatch");
+  failure("AVS.__function('[__garnet_token]i', 'i') {}", "Invalid or duplicate");
   failure("AVS.export(:Twice, 'i') {} ; AVS.export(:Twice, 'i') {}", "duplicate export");
   failure("AVS.export(:Twice, 'i') { raise 'callback failed' }; AVS.Twice(1)", "callback failed");
   failure("AVS.export(:Twice, 'i') { |x| AVS.Twice(x) }; AVS.Twice(1)", "nesting limit");

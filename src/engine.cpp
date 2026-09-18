@@ -23,6 +23,7 @@ static_assert(sizeof(mrb_float) == 8, "Garnet requires double precision mruby");
 struct Export {
   garnet_session* session;
   mrb_value block;
+  char returns = '.';
 };
 struct garnet_session {
   garnet_host host{};
@@ -225,7 +226,7 @@ void validate_signature(const std::string& signature) {
       if (end == std::string::npos)
         throw std::runtime_error("Unclosed parameter name");
       auto name = signature.substr(i, end - i);
-      if (!identifier(name) || !names.insert(fold(name)).second)
+      if (!identifier(name) || fold(name).find("__garnet_") == 0 || !names.insert(fold(name)).second)
         throw std::runtime_error("Invalid or duplicate exported parameter name");
       i = end + 1;
     }
@@ -256,6 +257,32 @@ mrb_value export_filter(mrb_state* mrb, mrb_value) {
         s.host.register_filter(s.host.identity, s.call_context, span(function), span(params), call_export, data));
     r.check();
     return mrb_nil_value();
+  } catch (const std::exception& e) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
+  }
+}
+mrb_value make_function(mrb_state* mrb, mrb_value) {
+  mrb_value signature, returns, block;
+  mrb_get_args(mrb, "oo&", &signature, &returns, &block);
+  try {
+    auto& s = session(mrb);
+    if (mrb_nil_p(block))
+      throw std::runtime_error("AVS.function requires a block");
+    const auto params = name_of(mrb, signature), output = name_of(mrb, returns);
+    validate_signature(params);
+    if (output.size() != 1 || std::string("cbifsn.").find(output[0]) == std::string::npos)
+      throw std::runtime_error("Invalid function return type");
+    if (s.exports.size() >= 4096)
+      throw std::runtime_error("Too many exported functions");
+    auto entry = std::make_unique<Export>(Export{&s, block, output[0]});
+    mrb_gc_register(mrb, block);
+    auto* data = entry.get();
+    s.exports.push_back(std::move(entry));
+    ResultGuard r(s.host.make_function(s.host.identity, s.call_context, span(params), call_export, data));
+    r.check();
+    if (r.value.value.type != GARNET_FUNCTION)
+      throw std::runtime_error("Host did not create a function");
+    return to_ruby(mrb, r.value.value);
   } catch (const std::exception& e) {
     mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
   }
@@ -369,6 +396,7 @@ mrb_value setup(mrb_state* mrb, void*) {
   mrb_define_class_method(mrb, avs, "call", invoke, args);
   mrb_define_class_method(mrb, avs, "method_missing", invoke, args);
   mrb_define_class_method(mrb, avs, "export", export_filter, MRB_ARGS_REQ(2) | MRB_ARGS_BLOCK());
+  mrb_define_class_method(mrb, avs, "__function", make_function, MRB_ARGS_REQ(2) | MRB_ARGS_BLOCK());
   mrb_define_class_method(mrb, avs, "get_var", get_var, MRB_ARGS_ARG(1, 1));
   mrb_define_class_method(mrb, avs, "[]", get_var, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, avs, "set_var", set_var, MRB_ARGS_REQ(2));
@@ -520,6 +548,33 @@ mrb_value callback_body(mrb_state* mrb, void* data) {
       args.push_back(to_ruby(mrb, call.args[i]));
     auto value = mrb_yield_argv(mrb, call.entry.block, static_cast<mrb_int>(args.size()), args.data());
     call.output = from_ruby(mrb, value);
+    const auto type = call.output->value.type;
+    bool valid = false;
+    switch (call.entry.returns) {
+      case '.':
+        valid = true;
+        break;
+      case 'c':
+        valid = type == GARNET_CLIP;
+        break;
+      case 'b':
+        valid = type == GARNET_BOOL;
+        break;
+      case 'i':
+        valid = type == GARNET_INT;
+        break;
+      case 'f':
+        valid = type == GARNET_FLOAT || type == GARNET_INT;
+        break;
+      case 's':
+        valid = type == GARNET_STRING;
+        break;
+      case 'n':
+        valid = type == GARNET_FUNCTION;
+        break;
+    }
+    if (!valid)
+      throw std::runtime_error("Ruby function return type mismatch");
     return value;
   } catch (const std::exception& e) {
     mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
@@ -561,7 +616,8 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
     *out = nullptr;
   if (!out || !host || host->revision != GARNET_CONTRACT_REVISION || host->size != sizeof(garnet_host) ||
       !host->identity || !host->invoke || !host->retain_clip || !host->release_clip || !host->register_filter ||
-      !host->get_var || !host->set_var || !host->retain_function || !host->release_function || !host->invoke_function)
+      !host->get_var || !host->set_var || !host->retain_function || !host->release_function || !host->invoke_function ||
+      !host->make_function)
     return garnet::error("Invalid Garnet host contract", GARNET_INVALID_CONTRACT);
   try {
     auto s = std::make_unique<garnet_session>();

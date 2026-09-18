@@ -3,6 +3,7 @@
 #include "result.hpp"
 #include <filesystem>
 #include <limits>
+#include <unordered_set>
 
 const AVS_Linkage* AVS_linkage = nullptr;
 namespace {
@@ -25,6 +26,7 @@ struct Host {
   garnet_host api{};
   garnet_session* session = nullptr;
   std::vector<std::unique_ptr<Export>> exports;
+  std::vector<std::unique_ptr<Export>> functions;
   ~Host() { garnet_destroy(session); }
 };
 void GARNET_CALL release_clip(void*, void* p) {
@@ -280,6 +282,103 @@ garnet_result GARNET_CALL register_filter(void* identity, void* context, garnet_
     return error("Unknown filter registration failure");
   }
 }
+AVSValue __cdecl dispatch_function(AVSValue args, void* data, IScriptEnvironment* env) {
+  auto& host = *static_cast<Host*>(data);
+  const auto token = args[0].AsLong();
+  if (token < 1 || static_cast<uint64_t>(token) > host.functions.size() || !args[1].IsArray())
+    env->ThrowError("Garnet: invalid function dispatch");
+  return exported_filter(args[1], host.functions[static_cast<size_t>(token - 1)].get(), env);
+}
+std::string function_source(const std::string& signature) {
+  std::string params, values;
+  std::unordered_set<std::string> used;
+  size_t count = 0;
+  for (size_t i = 0; i < signature.size(); ++count) {
+    if (count >= 256)
+      throw std::runtime_error("Too many function parameters");
+    const bool optional = signature[i] == '[';
+    std::string name = "__garnet_arg_" + std::to_string(count);
+    if (optional) {
+      const auto end = signature.find(']', ++i);
+      if (end == std::string::npos)
+        throw std::runtime_error("Unclosed function parameter");
+      name = signature.substr(i, end - i);
+      i = end + 1;
+      if (name.empty())
+        throw std::runtime_error("Empty function parameter");
+      for (size_t j = 0; j < name.size(); ++j) {
+        const auto c = name[j];
+        if (!(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (j && c >= '0' && c <= '9')))
+          throw std::runtime_error("Invalid function parameter");
+      }
+    }
+    auto folded = name;
+    for (auto& c : folded)
+      if (c >= 'A' && c <= 'Z')
+        c += 'a' - 'A';
+    if ((optional && folded.find("__garnet_") == 0) || !used.insert(folded).second)
+      throw std::runtime_error("Reserved or duplicate function parameter");
+    if (i == signature.size())
+      throw std::runtime_error("Missing function parameter type");
+    const char* type;
+    switch (signature[i++]) {
+      case 'c':
+        type = "clip";
+        break;
+      case 'b':
+        type = "bool";
+        break;
+      case 'i':
+        type = "int";
+        break;
+      case 'f':
+        type = "float";
+        break;
+      case 's':
+        type = "string";
+        break;
+      case 'n':
+        type = "func";
+        break;
+      case '.':
+        type = "val";
+        break;
+      default:
+        throw std::runtime_error("Unsupported function parameter type");
+    }
+    if (count) {
+      params += ",";
+      values += ",";
+    }
+    params += std::string(type) + " " + (optional ? "\"" + name + "\"" : name);
+    values += name;
+  }
+  return "function [__garnet_token](" + params + ") { return __GarnetDispatch(__garnet_token, args=[" + values + "]) }";
+}
+garnet_result GARNET_CALL make_function(void* identity, void* context, garnet_string signature,
+                                        garnet_callback callback, void* data) {
+  try {
+    auto& host = *static_cast<Host*>(identity);
+    auto* env = static_cast<IScriptEnvironment*>(context);
+    if (!env || !callback || host.functions.size() >= 4096)
+      return error("Cannot create Garnet function");
+    const auto source = function_source(text(signature));
+    auto entry = std::make_unique<Export>(Export{&host, callback, data});
+    host.functions.push_back(std::move(entry));
+    LocalContext local(env);
+    env->SetVar("__garnet_token", AVSValue(static_cast<int64_t>(host.functions.size())));
+    const auto value = env->Invoke("Eval", AVSValue(source.c_str()));
+    if (!value.IsFunction())
+      return error("AVS did not create a function value");
+    return result(from_avs(host, value));
+  } catch (const AvisynthError& e) {
+    return error(e.msg);
+  } catch (const std::exception& e) {
+    return error(e.what());
+  } catch (...) {
+    return error("Unknown function creation failure");
+  }
+}
 AVSValue __cdecl import_ruby(AVSValue args, void* data, IScriptEnvironment* env) {
   auto& host = *static_cast<Host*>(data);
   try {
@@ -316,6 +415,8 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
   try {
     if (env->FunctionExists("ImportRuby"))
       throw std::runtime_error("ImportRuby already registered");
+    if (env->FunctionExists("__GarnetDispatch"))
+      throw std::runtime_error("Garnet dispatcher already registered");
     auto host = std::make_unique<Host>();
     host->api = {GARNET_CONTRACT_REVISION,
                  sizeof(garnet_host),
@@ -328,12 +429,14 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
                  set_var,
                  retain_function,
                  release_function,
-                 invoke_function};
+                 invoke_function,
+                 make_function};
     ResultGuard r(garnet_create(&host->api, &host->session));
     r.check();
     env->AtExit(shutdown, host.get());
     auto* owned = host.release();
     env->AddFunction("ImportRuby", "s", import_ruby, owned);
+    env->AddFunction("__GarnetDispatch", "i[args].", dispatch_function, owned);
     return "Garnet Ruby binding";
   } catch (const std::exception& e) {
     env->ThrowError("Garnet initialization: %s", e.what());
