@@ -1,4 +1,19 @@
 require_relative 'lib/filters'
+def named_function(name)
+  AVS.function(options: {name => :int}, returns: :int) { |**values| values[name] || 0 }
+end
+AVS[:retained_factory_fn] = named_function(:Width)
+# More signatures than the factory cache can hold; retained native functions
+# must keep their parsed definition even after the cache drops its reference.
+160.times do |n|
+  key = "value_#{n}".to_sym
+  fn = named_function(key)
+  raise 'template churn' unless fn.call(**{key => 42}) == 42
+end
+GC.start
+raise 'evicted live factory' unless AVS[:retained_factory_fn].call(WiDtH: 42) == 42
+raise 'canonical signature' unless named_function(:WIDTH).call(width: 42) == 42
+AVS[:retained_factory_fn] = nil
 # Exercise real AVS closure creation/dispatch beyond the old cumulative limit.
 # The callback keeps a local reference to itself; no native owner is cached on
 # that Ruby object, so this does not pin each discarded function until close.

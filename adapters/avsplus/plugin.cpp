@@ -1,10 +1,10 @@
 #include <avisynth.h>
 #include <garnet/engine.h>
 #include "result.hpp"
+#include "template_cache.hpp"
 #include <filesystem>
 #include <limits>
 #include <unordered_set>
-#include <unordered_map>
 #include <mutex>
 
 const AVS_Linkage* AVS_linkage = nullptr;
@@ -31,7 +31,7 @@ struct Host {
   std::vector<std::unique_ptr<Export>> exports;
   std::mutex exports_gate;
   std::unordered_set<std::string> export_names;
-  std::unordered_map<std::string, AVSValue> function_factories;
+  TemplateCache<AVSValue> function_factories;
   std::mutex functions_gate;
   ~Host() { garnet_destroy(session); }
 };
@@ -460,22 +460,28 @@ garnet_result GARNET_CALL make_function(void* identity, void* context, garnet_st
     auto* env = static_cast<IScriptEnvironment*>(context);
     if (!env || !callback || !release_data)
       return error("Cannot create Garnet function");
-    const auto params = text(signature);
+    const auto params = template_key(text(signature));
     AVSValue factory;
     {
       std::lock_guard<std::mutex> lock(host.functions_gate);
-      const auto found = host.function_factories.find(params);
-      if (found != host.function_factories.end())
-        factory = found->second;
+      if (auto found = host.function_factories.find(params))
+        factory = *found;
     }
     if (!factory.Defined()) {
+      // Some older hosts retain every SaveString allocation without interning.
+      // On those hosts, repeatedly evicting/reparsing a finite set can grow
+      // permanent parser strings faster than keeping its factories alive.
+      const auto* probe = env->SaveString("__garnet_template_intern_probe");
+      const bool interned = probe == env->SaveString("__garnet_template_intern_probe");
       const auto source = function_source(params);
       // Eval can trigger autoload/reentry: never hold the registry mutex here.
       factory = env->Invoke("Eval", AVSValue(source.c_str()));
       if (!factory.IsFunction())
         return error("AVS did not create a function factory");
       std::lock_guard<std::mutex> lock(host.functions_gate);
-      factory = host.function_factories.emplace(params, factory).first->second;
+      if (!interned)
+        host.function_factories.keep_parsed();
+      factory = host.function_factories.insert(params, factory);
     }
     auto token = std::make_unique<FunctionToken>(host, callback, data, release_data);
     lease.release = nullptr;
