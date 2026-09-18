@@ -24,7 +24,9 @@ int main() {
     CHECK(cache.find("a").value() == retained);
     cache.insert("d", std::make_shared<Value>());
     CHECK(!cache.find("b") && cache.size() == 3 && Value::live == 3);
-    CHECK(cache.insert("a", std::make_shared<Value>()) == retained && Value::live == 3);
+    CHECK(cache.insert("a", std::make_shared<Value>()) == retained);
+    // A by-value parameter may be destroyed at the end of the full expression.
+    CHECK(Value::live == 3);
     for (int i = 0; i < 10000; ++i)
       cache.insert(std::to_string(i), std::make_shared<Value>());
     CHECK(cache.size() == 3 && Value::live == 4); // Eviction does not invalidate retained values.
