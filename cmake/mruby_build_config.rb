@@ -24,10 +24,16 @@ MRuby::Build.new('garnet', settings.fetch('build_root')) do |conf|
   end
   conf.enable_cxx_exception
   conf.cc.defines << 'MRB_INT64'
-  conf.cc.defines << 'MRB_WORDBOX_NO_FLOAT_TRUNCATE'
+  conf.cc.defines << 'MRB_WORDBOX_NO_INLINE_FLOAT'
   conf.cxx.defines << 'MRB_INT64'
-  conf.cxx.defines << 'MRB_WORDBOX_NO_FLOAT_TRUNCATE'
+  conf.cxx.defines << 'MRB_WORDBOX_NO_INLINE_FLOAT'
+  if settings.fetch('pointer_size') == 4
+    conf.cc.defines << 'MRB_NO_BOXING'
+    conf.cxx.defines << 'MRB_NO_BOXING'
+  end
   conf.gem core: 'mruby-compiler'
+  # mruby 4 parses literals outside int32 as bigint, even with MRB_INT64.
+  conf.gem core: 'mruby-bigint'
   conf.gem core: 'mruby-metaprog'
   conf.gem core: 'mruby-method'
   conf.gem core: 'mruby-enum-ext'

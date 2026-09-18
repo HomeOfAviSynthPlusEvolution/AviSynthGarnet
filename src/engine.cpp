@@ -8,11 +8,13 @@
 #include <mruby/data.h>
 #include <mruby/error.h>
 #include <mruby/hash.h>
+#include <mruby/numeric.h>
 #include <mruby/string.h>
 #include <mruby/proc.h>
 #include <mruby/irep.h>
 #include <mruby/debug.h>
 #include <filesystem>
+#include <charconv>
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
@@ -119,6 +121,19 @@ std::unique_ptr<Storage> from_ruby(mrb_state* mrb, mrb_value value, int depth = 
   } else if (mrb_integer_p(value)) {
     out->value.type = GARNET_INT;
     out->value.as.integer = mrb_integer(value);
+  } else if (mrb_bigint_p(value)) {
+    // mruby 4.0's mrb_as_int rejects INT64_MIN as well as genuine overflow.
+    // Use its native formatter (not an overridable Ruby method) and a checked
+    // conversion; normal integers retain the allocation-free path above.
+    const auto digits = mrb_integer_to_str(mrb, value, 10);
+    const auto* begin = RSTRING_PTR(digits);
+    const auto* end = begin + RSTRING_LEN(digits);
+    int64_t number = 0;
+    const auto parsed = std::from_chars(begin, end, number);
+    if (parsed.ec != std::errc{} || parsed.ptr != end)
+      mrb_raise(mrb, E_RANGE_ERROR, "Integer outside signed 64-bit range");
+    out->value.type = GARNET_INT;
+    out->value.as.integer = number;
   } else if (mrb_float_p(value)) {
     out->value.type = GARNET_FLOAT;
     out->value.as.floating = mrb_float(value);
@@ -623,8 +638,8 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
     auto s = std::make_unique<garnet_session>();
     s->host = *host;
     s->ruby = mrb_open();
-    if (!s->ruby)
-      throw std::bad_alloc();
+    if (MRB_OPEN_FAILURE(s->ruby))
+      throw std::runtime_error("mruby initialization failed");
     s->ruby->ud = s.get();
     mrb_bool failed = false;
     auto r = mrb_protect_error(s->ruby, setup, nullptr, &failed);

@@ -218,6 +218,25 @@ int main(int argc, char** argv) {
   CHECK(r.status == GARNET_INVALID_CONTRACT && !s);
   release_result(r);
   s = create(&host);
+  r = eval(&host, "9223372036854775807");
+  if (r.status != GARNET_OK)
+    fprintf(stderr, "INT64_MAX: %.*s\n", (int)r.error.size, r.error.data);
+  CHECK(r.status == GARNET_OK && r.value.as.integer == INT64_MAX);
+  release_result(r);
+  r = eval(&host, "-9223372036854775808");
+  if (r.status != GARNET_OK)
+    fprintf(stderr, "INT64_MIN: %.*s\n", (int)r.error.size, r.error.data);
+  CHECK(r.status == GARNET_OK && r.value.as.integer == INT64_MIN);
+  release_result(r);
+  r = eval(&host, "wide = 9223372036854775808; AVS.Echo(wide - 1)");
+  CHECK(r.status == GARNET_OK && r.value.type == GARNET_INT && r.value.as.integer == INT64_MAX);
+  release_result(r);
+  r = eval(&host, "raise unless MRUBY_VERSION == '4.0.0'; "
+                  "case {size: [320, 240]}; in {size: [width, height]}; width + height; else; 0; end");
+  if (r.status != GARNET_OK)
+    fprintf(stderr, "%.*s\n", (int)r.error.size, r.error.data);
+  CHECK(r.status == GARNET_OK && r.value.type == GARNET_INT && r.value.as.integer == 560);
+  release_result(r);
   r = eval(&host, "temporary = 42; temporary");
   CHECK(r.status == GARNET_OK && r.value.as.integer == 42);
   release_result(r);
@@ -232,6 +251,8 @@ int main(int argc, char** argv) {
   release_result(r);
   r = eval(&host,
            "AVS.Echo([nil, false, 0, 9223372036854775807, -9223372036854775808, 1.23456789012345, \"a\\0b\", [7]])");
+  if (r.status != GARNET_OK)
+    fprintf(stderr, "%.*s\n", (int)r.error.size, r.error.data);
   CHECK(r.status == GARNET_OK && r.value.type == GARNET_ARRAY && r.value.as.array.size == 8);
   CHECK(r.value.as.array.data[3].as.integer == INT64_MAX);
   CHECK(r.value.as.array.data[4].as.integer == INT64_MIN);
@@ -283,6 +304,8 @@ int main(int argc, char** argv) {
   garnet_destroy(s);
   CHECK(host.clips == 0);
   failure("AVS.Echo(Width: 1, width: 2)", "Duplicate");
+  failure("AVS.Echo(9223372036854775808)", "RangeError");
+  failure("AVS.Echo(-9223372036854775809)", "RangeError");
   failure("a = []; a << a; a", "nesting");
   failure("raise 'deliberate'", "deliberate");
   failure("raise 'line check'", "contract.avs.rb:1");
