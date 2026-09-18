@@ -48,7 +48,34 @@ struct garnet_session {
 };
 namespace {
 using namespace garnet;
-mrb_value load_file(mrb_state*, const std::string&, bool*);
+mrb_value load_file(mrb_state*, const std::string&, bool*, bool = true);
+std::filesystem::path relative_script_path(mrb_state* mrb, const char* name) {
+  auto path = std::filesystem::u8path(name);
+  if (path.is_absolute())
+    return path;
+  for (auto* ci = mrb->c->ci; ci >= mrb->c->cibase; --ci) {
+    if (ci->proc && !MRB_PROC_CFUNC_P(ci->proc)) {
+      const auto* filename = mrb_debug_get_filename(mrb, ci->proc->body.irep, 0);
+      if (filename && *filename)
+        return std::filesystem::u8path(filename).parent_path() / path;
+    }
+    if (ci == mrb->c->cibase)
+      break;
+  }
+  throw std::runtime_error("Relative import has no source filename");
+}
+mrb_value import_relative(mrb_state* mrb, mrb_value self) {
+  const char* name;
+  mrb_get_args(mrb, "z", &name);
+  try {
+    const auto path = relative_script_path(mrb, name).u8string();
+    auto avs = mrb_obj_value(mrb_module_get(mrb, "AVS"));
+    return mrb_funcall(mrb, avs, "call", 3, mrb_symbol_value(mrb_intern_lit(mrb, "ImportScript")), self,
+                       mrb_str_new(mrb, path.data(), path.size()));
+  } catch (const std::exception& e) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
+  }
+}
 mrb_value require_relative(mrb_state* mrb, mrb_value) {
   const char* name;
   mrb_get_args(mrb, "z", &name);
@@ -408,6 +435,7 @@ mrb_value setup(mrb_state* mrb, void*) {
   mrb_define_method(mrb, function, "call", invoke, args);
   mrb_define_method(mrb, clip, "filter", invoke, args);
   mrb_define_method(mrb, clip, "method_missing", invoke, args);
+  mrb_define_method(mrb, clip, "import_relative", import_relative, MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, avs, "call", invoke, args);
   mrb_define_class_method(mrb, avs, "method_missing", invoke, args);
   mrb_define_class_method(mrb, avs, "export", export_filter, MRB_ARGS_REQ(2) | MRB_ARGS_BLOCK());
@@ -454,6 +482,7 @@ struct Evaluation {
   std::string filename;
   std::unique_ptr<Storage> output;
   bool file = false;
+  bool pipeline = false;
 };
 mrb_value execute_source(mrb_state* mrb, garnet_string source, const std::string& filename) {
   const auto deleter = [mrb](mrb_ccontext* p) {
@@ -476,7 +505,7 @@ mrb_value execute_source(mrb_state* mrb, garnet_string source, const std::string
   // when a library is loaded from inside another Ruby method.
   return mrb_yield_with_class(mrb, proc, 0, nullptr, mrb_top_self(mrb), mrb->object_class);
 }
-mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached) {
+mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached, bool cache_result) {
   auto& s = session(mrb);
   const auto path = std::filesystem::canonical(std::filesystem::u8path(filename));
   const auto resolved = path.u8string();
@@ -485,7 +514,7 @@ mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached) {
   key = fold(key);
 #endif
   const auto found = s.loaded.find(key);
-  if (found != s.loaded.end()) {
+  if (cache_result && found != s.loaded.end()) {
     if (cached)
       *cached = true;
     return found->second;
@@ -501,12 +530,14 @@ mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached) {
   s.loading.insert(key);
   try {
     auto value = execute_source(mrb, span(source), resolved);
-    mrb_gc_register(mrb, value);
-    try {
-      s.loaded.emplace(key, value);
-    } catch (...) {
-      mrb_gc_unregister(mrb, value);
-      throw;
+    if (cache_result) {
+      mrb_gc_register(mrb, value);
+      try {
+        s.loaded.emplace(key, value);
+      } catch (...) {
+        mrb_gc_unregister(mrb, value);
+        throw;
+      }
     }
     s.loading.erase(key);
     return value;
@@ -519,7 +550,7 @@ mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached) {
 mrb_value evaluate_body(mrb_state* mrb, void* data) {
   try {
     auto& e = *static_cast<Evaluation*>(data);
-    auto value = e.file ? load_file(mrb, e.filename, nullptr) : execute_source(mrb, e.source, e.filename);
+    auto value = e.file ? load_file(mrb, e.filename, nullptr, !e.pipeline) : execute_source(mrb, e.source, e.filename);
     if (!mrb->exc)
       e.output = from_ruby(mrb, value);
     return value;
@@ -653,16 +684,18 @@ extern "C" garnet_result GARNET_CALL garnet_create(const garnet_host* host, garn
   }
 }
 static garnet_result evaluate(garnet_session* s, void* context, garnet_string source, garnet_string filename,
-                              bool file) {
+                              bool file, bool pipeline = false) {
   if (!s || (!source.data && source.size))
     return garnet::error("Invalid evaluation input");
   try {
     std::unique_lock<std::recursive_mutex> lock(s->gate, std::try_to_lock);
-    if (!lock.owns_lock() || s->active)
+    if (!lock.owns_lock() || (s->active && !file))
       return garnet::error("Concurrent or reentrant Ruby entry", GARNET_BUSY);
     if (s->poisoned)
       return garnet::error("Ruby session disabled after failed evaluation");
-    Evaluation e{source, garnet::text(filename), nullptr, file};
+    if (s->depth >= 64)
+      return garnet::error("Ruby script nesting limit exceeded");
+    Evaluation e{source, garnet::text(filename), nullptr, file, pipeline};
     if (e.filename.find('\0') != std::string::npos)
       return garnet::error("NUL in filename");
     Active active(*s, context);
@@ -671,6 +704,8 @@ static garnet_result evaluate(garnet_session* s, void* context, garnet_string so
     check_ruby(s->ruby, failed, value);
     if (s->poisoned || s->import_failed)
       throw std::runtime_error("Ruby session disabled after a failed nested import");
+    if (pipeline && (!e.output || e.output->value.type != GARNET_CLIP))
+      throw std::runtime_error("Pipeline script must return a clip");
     auto output = garnet::result(std::move(e.output));
     active.done = true;
     return output;
@@ -686,6 +721,9 @@ extern "C" garnet_result GARNET_CALL garnet_evaluate(garnet_session* s, void* co
 }
 extern "C" garnet_result GARNET_CALL garnet_import(garnet_session* s, void* context, garnet_string filename) {
   return evaluate(s, context, {}, filename, true);
+}
+extern "C" garnet_result GARNET_CALL garnet_run_script(garnet_session* s, void* context, garnet_string filename) {
+  return evaluate(s, context, {}, filename, true, true);
 }
 extern "C" void GARNET_CALL garnet_destroy(garnet_session* s) {
   delete s;

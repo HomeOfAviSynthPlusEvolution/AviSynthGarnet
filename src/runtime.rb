@@ -1,3 +1,12 @@
+module Kernel
+  # Input supplied by the AVS host; ordinary Ruby expressions do not update it.
+  def last
+    clip = AVS.get_var(:last)
+    raise TypeError, 'last is not a clip' unless clip.is_a?(AVS::Clip)
+    clip
+  end
+end
+
 module AVS
   def self.function_exists?(name)
     call(:FunctionExists, name.to_s)

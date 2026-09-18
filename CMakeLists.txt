@@ -55,5 +55,11 @@ if(GARNET_BUILD_TESTS)
     add_test(NAME garnet_avs_libraries COMMAND garnet_avs_tests
       "${GARNET_TEST_AVS_RUNTIME}" "$<TARGET_FILE:garnet_plugin>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/export.avs")
     set_tests_properties(garnet_avs_libraries PROPERTIES TIMEOUT 30)
+    foreach(_pipeline avs-avs avs-ruby ruby-avs ruby-ruby nested failure cycle)
+      add_test(NAME garnet_pipeline_${_pipeline} COMMAND garnet_avs_tests
+        "${GARNET_TEST_AVS_RUNTIME}" "$<TARGET_FILE:garnet_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/pipeline/${_pipeline}.avs")
+      set_tests_properties(garnet_pipeline_${_pipeline} PROPERTIES TIMEOUT 30)
+    endforeach()
   endif()
 endif()

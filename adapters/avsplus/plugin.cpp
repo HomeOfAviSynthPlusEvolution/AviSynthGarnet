@@ -229,9 +229,11 @@ garnet_result GARNET_CALL set_var(void* identity, void* context, garnet_string n
     const auto key = variable_name(name);
     const auto converted = to_avs(*static_cast<Host*>(identity), env, *value);
     const auto* saved = env->SaveString(key.c_str());
-    const bool ok = global ? env->SetGlobalVar(saved, converted) : env->SetVar(saved, converted);
-    if (!ok)
-      return error("Variable assignment failed");
+    // The bool reports insertion versus replacement, not success/failure.
+    if (global)
+      env->SetGlobalVar(saved, converted);
+    else
+      env->SetVar(saved, converted);
     return {};
   } catch (const AvisynthError& e) {
     return error(e.msg);
@@ -379,6 +381,50 @@ garnet_result GARNET_CALL make_function(void* identity, void* context, garnet_st
     return error("Unknown function creation failure");
   }
 }
+AVSValue __cdecl import_script(AVSValue args, void* data, IScriptEnvironment* env) {
+  auto& host = *static_cast<Host*>(data);
+  try {
+    auto path = std::filesystem::u8path(args[1].AsString());
+    if (path.is_relative()) {
+      const auto dir = env->GetVarDef("$ScriptDirUtf8$");
+      if (dir.IsString())
+        path = std::filesystem::u8path(dir.AsString()) / path;
+    }
+    path = std::filesystem::canonical(path);
+    const auto filename = path.u8string();
+    auto extension = path.extension().u8string();
+    for (auto& c : extension)
+      if (c >= 'A' && c <= 'Z')
+        c += 'a' - 'A';
+    if (extension != ".rb" && extension != ".avs" && extension != ".avsi")
+      throw std::runtime_error("ImportScript expects .avs, .avsi or .rb");
+    // Local variables and last are scoped; explicit globals and registered
+    // functions keep their normal AVS semantics.
+    LocalContext local(env);
+    const auto depth = env->GetVarDef("__garnet_import_depth", 0).AsInt();
+    if (depth >= 64)
+      throw std::runtime_error("Pipeline script nesting limit exceeded");
+    env->SetVar("__garnet_import_depth", depth + 1);
+    env->SetVar("last", args[0]);
+    AVSValue value;
+    if (extension == ".rb") {
+      ResultGuard r(garnet_run_script(host.session, env, span(filename)));
+      r.check();
+      value = to_avs(host, env, r.value.value);
+    } else {
+      // filename is UTF-8; request the native Import UTF-8 path mode.
+      AVSValue values[] = {env->SaveString(filename.c_str()), true};
+      const char* names[] = {nullptr, "utf8"};
+      value = env->Invoke("Import", AVSValue(values, 2), names);
+    }
+    if (!value.IsClip())
+      throw std::runtime_error("Pipeline script must return a clip");
+    return value;
+  } catch (const std::exception& e) {
+    env->ThrowError("ImportScript: %s", e.what());
+  }
+  return AVSValue();
+}
 AVSValue __cdecl import_ruby(AVSValue args, void* data, IScriptEnvironment* env) {
   auto& host = *static_cast<Host*>(data);
   try {
@@ -415,6 +461,8 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
   try {
     if (env->FunctionExists("ImportRuby"))
       throw std::runtime_error("ImportRuby already registered");
+    if (env->FunctionExists("ImportScript"))
+      throw std::runtime_error("ImportScript already registered");
     if (env->FunctionExists("__GarnetDispatch"))
       throw std::runtime_error("Garnet dispatcher already registered");
     auto host = std::make_unique<Host>();
@@ -436,6 +484,7 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
     env->AtExit(shutdown, host.get());
     auto* owned = host.release();
     env->AddFunction("ImportRuby", "s", import_ruby, owned);
+    env->AddFunction("ImportScript", "cs", import_script, owned);
     env->AddFunction("__GarnetDispatch", "i[args].", dispatch_function, owned);
     return "Garnet Ruby binding";
   } catch (const std::exception& e) {

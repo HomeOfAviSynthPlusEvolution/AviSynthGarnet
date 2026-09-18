@@ -321,6 +321,32 @@ int main(int argc, char** argv) {
   failure("AVS.filter(:Twice, args: {value: :unknown}) {}", "unknown AVS type");
   CHECK(argc == 2);
   {
+    fake_host pipeline = {0};
+    char path[4096];
+    garnet_session* runner = create(&pipeline);
+    snprintf(path, sizeof(path), "%s/pipeline-count.avs.rb", argv[1]);
+    r = garnet_import(runner, &pipeline.context, str(path));
+    CHECK(r.status == GARNET_OK && r.value.type == GARNET_CLIP);
+    release_result(r);
+    for (int i = 0; i < 2; ++i) {
+      r = garnet_run_script(runner, &pipeline.context, str(path));
+      CHECK(r.status == GARNET_OK && r.value.type == GARNET_CLIP);
+      release_result(r);
+    }
+    r = eval(&pipeline, "$pipeline_runs");
+    CHECK(r.status == GARNET_OK && r.value.as.integer == 3);
+    release_result(r);
+    snprintf(path, sizeof(path), "%s/pipeline-value.avs.rb", argv[1]);
+    r = garnet_run_script(runner, &pipeline.context, str(path));
+    CHECK(r.status != GARNET_OK && strstr(r.error.data, "must return a clip"));
+    release_result(r);
+    r = eval(&pipeline, "42");
+    CHECK(r.status != GARNET_OK && strstr(r.error.data, "disabled"));
+    release_result(r);
+    garnet_destroy(runner);
+    CHECK(pipeline.clips == 0);
+  }
+  {
     fake_host imports = {0};
     char path[4096];
     garnet_session* loader = create(&imports);
