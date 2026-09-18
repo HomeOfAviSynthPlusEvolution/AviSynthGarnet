@@ -87,5 +87,21 @@ if(GARNET_BUILD_TESTS)
       "${GARNET_TEST_AVS_RUNTIME}" "$<TARGET_FILE:garnet_plugin>"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/pipeline/deferred-mt.avs" "stamp")
     set_tests_properties(garnet_pipeline_deferred_mt PROPERTIES TIMEOUT 30 PROCESSORS 4)
+    # Keep the runnable examples checked against small native AVS equivalents.
+    function(garnet_example_test name script reference)
+      add_test(NAME garnet_example_${name} COMMAND garnet_avs_tests
+        "${GARNET_TEST_AVS_RUNTIME}" "$<TARGET_FILE:garnet_plugin>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/${script}" --reference
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/examples/${reference}.avs")
+      set_tests_properties(garnet_example_${name} PROPERTIES TIMEOUT 30)
+    endfunction()
+    garnet_example_test(library_from_avs examples/library_from_avs.avs bicubic)
+    garnet_example_test(library_from_ruby examples/library_from_ruby.avs bicubic)
+    garnet_example_test(pipeline examples/pipeline.avs pipeline)
+    garnet_example_test(preset_filter examples/preset_filter.avs bilinear)
+    garnet_example_test(function_values examples/function_values.avs bilinear)
+    garnet_example_test(frame_callback examples/frame_callback.avs frame_callback)
+    garnet_example_test(preset_settings tests/examples/preset_settings.avs preset_settings_reference)
+    set_tests_properties(garnet_example_frame_callback PROPERTIES PROCESSORS 4)
   endif()
 endif()

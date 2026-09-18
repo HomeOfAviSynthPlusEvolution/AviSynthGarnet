@@ -1,5 +1,6 @@
 #define AVSC_NO_DECLSPEC
 #include <windows.h>
+#include <algorithm>
 #include <cstdlib>
 #include <avisynth_c.h>
 #include <cstdio>
@@ -8,8 +9,10 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-  if (argc != 4 && argc != 5) {
-    std::fprintf(stderr, "usage: avs_tests runtime plugin script\n");
+  const bool stamp = argc == 5 && std::strcmp(argv[4], "stamp") == 0;
+  const bool reference_script = argc == 6 && std::strcmp(argv[4], "--reference") == 0;
+  if (argc != 4 && !stamp && !reference_script) {
+    std::fprintf(stderr, "usage: avs_tests runtime plugin script [stamp | --reference native.avs]\n");
     return 2;
   }
   auto dll = LoadLibraryA(argv[1]);
@@ -76,16 +79,36 @@ int main(int argc, char** argv) {
     ruby = avs_take_clip(output, env);
     avs_release_value(output);
     auto expected =
-        call("Eval", argc == 5 ? "ColorBars(width=720,height=480,pixel_type=\"YV12\").ScriptClip(\"last.BilinearResize("
+        reference_script
+            ? call("Import", argv[5])
+            : call("Eval", stamp
+                               ? "ColorBars(width=720,height=480,pixel_type=\"YV12\").ScriptClip(\"last.BilinearResize("
                                  "360,240).PointResize(720,480)\").PointResize(360,240)"
                                : "ColorBars(width=720,height=480,pixel_type=\"YV12\").BilinearResize(360,240)");
+    if (!avs_is_clip(expected)) {
+      avs_release_value(expected);
+      throw std::runtime_error("Native reference did not return clip");
+    }
     reference = avs_take_clip(expected, env);
     avs_release_value(expected);
     const auto* vi = avs_get_video_info(ruby);
-    if (vi->width != 360 || vi->height != 240)
-      throw std::runtime_error("Wrong output size");
+    const auto* ref_vi = avs_get_video_info(reference);
+    if (vi->width != ref_vi->width || vi->height != ref_vi->height || vi->pixel_type != ref_vi->pixel_type ||
+        vi->fps_numerator != ref_vi->fps_numerator || vi->fps_denominator != ref_vi->fps_denominator ||
+        (reference_script && vi->num_frames != ref_vi->num_frames))
+      throw std::runtime_error("Video metadata differs from native AVS graph");
     std::vector<int> requests{0, 1, 3, 1};
-    if (argc == 5) {
+    if (reference_script) {
+      if (vi->num_frames <= 0)
+        throw std::runtime_error("Example returned an empty clip");
+      requests.clear();
+      // Examples are short synthetic clips. Read every frame up to this bound,
+      // then seek/repeat to catch callbacks that assume monotonic frame requests.
+      for (int n = 0; n < (std::min)(vi->num_frames, 64); ++n)
+        requests.push_back(n);
+      for (int n : {vi->num_frames - 1, 0, vi->num_frames / 2, 0})
+        requests.push_back(n);
+    } else if (stamp) {
       requests.clear();
       for (int n = 0; n < 64; ++n)
         requests.push_back(n);
@@ -102,7 +125,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(avs_clip_get_error(reference));
       }
       bool equal = true;
-      if (argc == 5) {
+      if (stamp) {
         int error = 0;
         const auto* properties = avs_get_frame_props_ro(env, actual_frame);
         const auto stamp = avs_prop_get_int(env, properties, "garnet_n", 0, &error);
@@ -128,7 +151,7 @@ int main(int argc, char** argv) {
       if (!equal)
         throw std::runtime_error("Frame differs from native AVS graph");
     }
-    std::printf("Ruby main returned 360x240 YV12; %zu frame requests match native AVS byte-for-byte\n",
+    std::printf("Script returned %dx%d; %zu frame requests match native AVS byte-for-byte\n", vi->width, vi->height,
                 requests.size());
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
