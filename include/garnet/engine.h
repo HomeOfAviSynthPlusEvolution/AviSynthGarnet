@@ -1,0 +1,20 @@
+#ifndef GARNET_ENGINE_H
+#define GARNET_ENGINE_H
+#include "host.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct garnet_session garnet_session;
+/* On failure *out is null. Table is copied; identity remains borrowed. */
+garnet_result GARNET_CALL garnet_create(const garnet_host* host, garnet_session** out);
+/* Returns the last expression. Fresh parser locals, shared VM/constants.
+ * Failed evaluation disables the session. Initial implementation rejects
+ * concurrent/reentrant entry. Source and filename are borrowed UTF-8 spans. */
+garnet_result GARNET_CALL garnet_evaluate(garnet_session*, void* call_context, garnet_string source,
+                                          garnet_string filename);
+/* Caller ensures no active calls and releases outstanding results first. */
+void GARNET_CALL garnet_destroy(garnet_session*);
+#ifdef __cplusplus
+}
+#endif
+#endif
