@@ -22,7 +22,9 @@ garnet_result GARNET_CALL garnet_create(const garnet_host* host, garnet_session*
 garnet_result GARNET_CALL garnet_evaluate(garnet_session*, void* call_context, garnet_string source,
                                           garnet_string filename);
 /* Import a UTF-8 file path once per session. Repeated imports return the cached
- * final expression; require_relative shares this registry and returns bool. */
+ * final expression; require_relative shares this registry and returns bool.
+ * Concurrent first imports wait (up to five seconds, without VM ownership)
+ * for the initializer; recursive import dependencies report a cycle. */
 garnet_result GARNET_CALL garnet_import(garnet_session*, void* call_context, garnet_string filename);
 /* Execute a pipeline file every time, ignoring the library cache. The host
  * supplies a scoped 'last' clip through get_var. Requires a clip result. */

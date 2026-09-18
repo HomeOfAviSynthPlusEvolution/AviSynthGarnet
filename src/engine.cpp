@@ -35,6 +35,13 @@ struct RetiredHandle {
   RetiredHandle* next = nullptr;
   virtual ~RetiredHandle() = default;
 };
+struct ImportState {
+  garnet::Invocation* owner;
+  std::mutex gate;
+  std::condition_variable ready;
+  bool finished = false;
+  explicit ImportState(garnet::Invocation* owner) : owner(owner) {}
+};
 struct garnet_session {
   garnet_host host{};
   mrb_state* ruby = nullptr;
@@ -46,7 +53,8 @@ struct garnet_session {
   bool poisoned = false;
   bool import_failed = false;
   std::unordered_map<std::string, mrb_value> loaded;
-  std::unordered_set<std::string> loading;
+  std::unordered_map<std::string, std::shared_ptr<ImportState>> loading;
+  std::unordered_map<garnet::Invocation*, std::shared_ptr<ImportState>> import_waits;
   std::vector<std::unique_ptr<Export>> exports;
   RetiredHandle* retired = nullptr;
   bool stopping = false;
@@ -641,21 +649,65 @@ mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached, b
 #ifdef _WIN32
   key = fold(key);
 #endif
-  const auto found = s.loaded.find(key);
-  if (cache_result && found != s.loaded.end()) {
-    if (cached)
-      *cached = true;
-    return found->second;
+  for (;;) {
+    if (s.poisoned || s.import_failed)
+      throw std::runtime_error("Ruby session disabled after failed initialization");
+    const auto found = s.loaded.find(key);
+    if (cache_result && found != s.loaded.end()) {
+      if (cached)
+        *cached = true;
+      return found->second;
+    }
+    const auto loading = s.loading.find(key);
+    if (loading == s.loading.end())
+      break;
+    const auto state = loading->second;
+    auto* invocation = s.execution.current;
+    // Follow visible import dependencies. Native worker dependencies cannot be
+    // inspected, so the wait below is bounded separately and never called a
+    // circular import without evidence.
+    for (auto* owner = state->owner; owner;) {
+      for (auto* ancestor = Invocation::caller; ancestor; ancestor = ancestor->previous)
+        if (owner == ancestor)
+          throw std::runtime_error("Circular Ruby import: " + resolved);
+      const auto waiting = s.import_waits.find(owner);
+      owner = waiting == s.import_waits.end() ? nullptr : waiting->second->owner;
+    }
+    s.import_waits.emplace(invocation, state);
+    struct ClearWait {
+      garnet_session& session;
+      Invocation* invocation;
+      ~ClearWait() { session.import_waits.erase(invocation); }
+    } clear{s, invocation};
+    bool ready;
+    {
+      OutsideVM outside(*invocation);
+      std::unique_lock<std::mutex> lock(state->gate);
+      ready = state->ready.wait_for(lock, std::chrono::seconds(5), [&] { return state->finished; });
+    }
+    if (!ready)
+      throw std::runtime_error("Ruby import wait exceeded 5 seconds (initialization or native dependency): " +
+                               resolved);
   }
-  if (s.loading.count(key))
-    throw std::runtime_error("Circular Ruby import: " + resolved);
   std::ifstream input(path, std::ios::binary);
   if (!input)
     throw std::runtime_error("Cannot open Ruby script: " + resolved);
   const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
   if (input.bad())
     throw std::runtime_error("Cannot read Ruby script: " + resolved);
-  s.loading.insert(key);
+  auto state = std::make_shared<ImportState>(s.execution.current);
+  s.loading.emplace(key, state);
+  const auto finish = [&] {
+    // Invalidate the pointer while holding the VM gate, before the owner's
+    // invocation can disappear. Waiters may outlive a completed initializer.
+    state->owner = nullptr;
+    s.loading.erase(key);
+    {
+      std::lock_guard<std::mutex> lock(state->gate);
+      state->finished = true;
+    }
+    state->ready.notify_all();
+  };
   try {
     auto value = execute_source(mrb, span(source), resolved);
     if (cache_result) {
@@ -667,11 +719,11 @@ mrb_value load_file(mrb_state* mrb, const std::string& filename, bool* cached, b
         throw;
       }
     }
-    s.loading.erase(key);
+    finish();
     return value;
   } catch (...) {
-    s.loading.erase(key);
     s.import_failed = true;
+    finish();
     throw;
   }
 }

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string_view>
 #include <thread>
@@ -39,6 +40,8 @@ struct Host {
   std::mutex events;
   std::condition_variable event;
   bool a_parked = false, b_parked = false, release_b = false;
+  bool importing = false, finish_import = false;
+  int entrants = 0, imported = 0;
 };
 struct Context {
   std::thread::id thread = std::this_thread::get_id();
@@ -69,6 +72,17 @@ garnet_result GARNET_CALL invoke(void* identity, void* context, garnet_string na
     auto r = call(host, 0);
     CHECK(r.status == GARNET_OK);
     release(r);
+  } else if (filter == "BeforeImport" || filter == "InitializeImport" || filter == "AfterImport") {
+    std::unique_lock<std::mutex> lock(host.events);
+    if (filter == "BeforeImport")
+      ++host.entrants;
+    else if (filter == "AfterImport")
+      ++host.imported;
+    else
+      host.importing = true;
+    host.event.notify_all();
+    if (filter == "InitializeImport")
+      CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.finish_import; }));
   } else if (filter == "NestedFailure") {
     return call(host, 6);
   } else if (filter == "Failure") {
@@ -131,7 +145,9 @@ garnet_result GARNET_CALL make_function(void*, void*, garnet_string, garnet_call
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  CHECK(argc == 2);
+  const auto filename = (std::filesystem::u8path(argv[1]) / "concurrency.avs.rb").u8string();
   Host host;
   garnet_host api{GARNET_CONTRACT_REVISION,
                   sizeof(garnet_host),
@@ -193,6 +209,12 @@ AVS.export('Count', 'i') do |mode|
     GC.start
     raise 'call context changed' unless AVS[:local] == mode
     next 42
+  elsif mode == 8 || mode == 9
+    AVS.BeforeImport
+    loaded = require_relative(mode == 8 ? 'concurrent-library.rb' : 'concurrent-failure.rb')
+    raise 'incomplete library' unless $library_count == 1 && $library_ready
+    AVS.AfterImport
+    next loaded ? 1 : 0
   elsif mode == 6
     raise 'ordinary callback failure'
   elsif mode == 7
@@ -218,7 +240,7 @@ AVS.export('Count', 'i') do |mode|
 end
 nil
 )RUBY"),
-                      str("concurrency.avs.rb"));
+                      str(filename.c_str()));
   if (r.status != GARNET_OK)
     std::fprintf(stderr, "%.*s\n", static_cast<int>(r.error.size), r.error.data);
   CHECK(r.status == GARNET_OK && host.callback);
@@ -273,6 +295,48 @@ nil
   }
   host.event.notify_all();
   b.join();
+  std::thread initializer([&] { check(call(host, 8), 1); });
+  {
+    std::unique_lock<std::mutex> lock(host.events);
+    CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.importing; }));
+  }
+  std::thread waiter([&] { check(call(host, 8), 0); });
+  {
+    std::unique_lock<std::mutex> lock(host.events);
+    CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.entrants == 2; }));
+    CHECK(!host.event.wait_for(lock, std::chrono::milliseconds(50), [&] { return host.imported != 0; }));
+    host.finish_import = true;
+  }
+  host.event.notify_all();
+  initializer.join();
+  waiter.join();
+  check(call(host, 8), 0);
+  {
+    std::lock_guard<std::mutex> lock(host.events);
+    host.importing = host.finish_import = false;
+    host.entrants = host.imported = 0;
+  }
+  const auto fail_import = [&] {
+    auto failure = call(host, 9);
+    CHECK(failure.status == GARNET_ERROR);
+    release(failure);
+  };
+  std::thread failing_initializer(fail_import);
+  {
+    std::unique_lock<std::mutex> lock(host.events);
+    CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.importing; }));
+  }
+  std::thread failing_waiter(fail_import);
+  {
+    std::unique_lock<std::mutex> lock(host.events);
+    CHECK(host.event.wait_for(lock, std::chrono::seconds(5), [&] { return host.entrants == 2; }));
+    host.event.wait_for(lock, std::chrono::milliseconds(50));
+    host.finish_import = true;
+  }
+  host.event.notify_all();
+  failing_initializer.join();
+  failing_waiter.join();
+  CHECK(host.imported == 0);
   garnet_destroy(host.session);
   std::puts("PASS host handoff, original thread/context, GC, C blocks, exceptions and non-LIFO completion");
   return 0;
