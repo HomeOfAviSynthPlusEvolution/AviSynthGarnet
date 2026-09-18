@@ -29,6 +29,11 @@ struct Host {
   garnet_session* session = nullptr;
   garnet_callback callback = nullptr;
   void* data = nullptr;
+  garnet_callback function_callback = nullptr;
+  void* function_data = nullptr;
+  std::thread::id entry_thread = std::this_thread::get_id();
+  bool check_release_thread = false;
+  std::atomic<bool> allow_failed_entry{false};
   std::atomic<int> live{0}, released{0}, reentries{0};
   std::atomic<bool> reenter{true};
   std::mutex events;
@@ -46,6 +51,9 @@ struct Handle {
 };
 void GARNET_CALL release_handle(void* pointer) {
   auto* handle = static_cast<Handle*>(pointer);
+  // Check EVERY release, not only the final reference. This catches exception
+  // cleanup deterministically even if GC has not discarded the Ruby wrapper.
+  CHECK(!handle->host.check_release_thread || std::this_thread::get_id() != handle->host.entry_thread);
   if (--handle->references != 0)
     return;
   auto& host = handle->host;
@@ -57,7 +65,8 @@ void GARNET_CALL release_handle(void* pointer) {
     // able to enter Ruby and collect again, not time out waiting for the VM.
     std::thread worker([&] {
       auto r = host.callback(host.data, &host, nullptr, 0);
-      CHECK(r.status == GARNET_OK && r.value.type == GARNET_INT && r.value.as.integer == 42);
+      CHECK((r.status == GARNET_OK && r.value.type == GARNET_INT && r.value.as.integer == 42) ||
+            (host.allow_failed_entry && r.status == GARNET_ERROR));
       release(r);
       {
         std::lock_guard<std::mutex> lock(host.events);
@@ -119,9 +128,12 @@ garnet_result GARNET_CALL invoke_function(void*, void*, void*, const garnet_valu
   CHECK(false);
   return {};
 }
-garnet_result GARNET_CALL make_function(void*, void*, garnet_string, garnet_callback, void*) {
-  CHECK(false);
-  return {};
+garnet_result GARNET_CALL make_function(void* identity, void*, garnet_string, garnet_callback callback, void* data) {
+  auto& host = *static_cast<Host*>(identity);
+  host.function_callback = callback;
+  host.function_data = data;
+  ++host.live;
+  return owned(new Handle{host, GARNET_FUNCTION});
 }
 void eval(Host& host, const char* source, bool success = true) {
   auto r = garnet_evaluate(host.session, &host, str(source), str("release.avs.rb"));
@@ -179,6 +191,30 @@ int main() {
   eval(failed, "$clip = nil; $fn = nil; GC.start; raise 'deliberate failure'", false);
   garnet_destroy(failed.session);
   CHECK(failed.live == 0 && failed.released == 2);
+  {
+    Host mismatch;
+    mismatch.check_release_thread = true;
+    mismatch.allow_failed_entry = true;
+    create(mismatch);
+    eval(mismatch, "$fn = AVS.function(returns: :int) { AVS.Source }; nil");
+    auto r = mismatch.function_callback(mismatch.function_data, &mismatch, nullptr, 0);
+    CHECK(r.status == GARNET_ERROR);
+    CHECK(std::string_view(r.error.data, r.error.size).find("return type mismatch") != std::string_view::npos);
+    release(r);
+    mismatch.reenter = false;
+    garnet_destroy(mismatch.session);
+    CHECK(mismatch.live == 0 && mismatch.released == 2);
+  }
+  for (const auto* source : {"[AVS.Source, Object.new]", "AVS.call(:Unused, [AVS.Source, Object.new])"}) {
+    Host partial;
+    partial.check_release_thread = true;
+    partial.allow_failed_entry = true;
+    create(partial);
+    eval(partial, source, false);
+    partial.reenter = false;
+    garnet_destroy(partial.session);
+    CHECK(partial.live == 0 && partial.released == 1);
+  }
   std::puts("PASS deferred clip/function release, cross-thread destructor reentry, nesting, failure and close");
   return 0;
 }

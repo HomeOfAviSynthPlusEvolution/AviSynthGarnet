@@ -212,13 +212,8 @@ garnet_session& session(mrb_state* mrb) {
 }
 struct Clip : RetiredHandle {
   void* identity;
-  ResultGuard retained;
-  Clip(const garnet_host& host, void* handle)
-      : identity(host.identity), retained(host.retain_clip(host.identity, handle)) {
-    retained.check();
-    if (retained.value.value.type != GARNET_CLIP || !retained.value.value.as.handle)
-      throw std::runtime_error("Invalid retained clip");
-  }
+  ResultGuard retained{{}};
+  explicit Clip(void* host) : identity(host) {}
 };
 void free_clip(mrb_state* mrb, void* p) {
   session(mrb).retire(static_cast<Clip*>(p));
@@ -226,25 +221,19 @@ void free_clip(mrb_state* mrb, void* p) {
 const mrb_data_type clip_type{"AVS::Clip", free_clip};
 struct Function : RetiredHandle {
   void* identity;
-  ResultGuard retained;
-  Function(const garnet_host& host, void* handle)
-      : identity(host.identity), retained(host.retain_function(host.identity, handle)) {
-    retained.check();
-    if (retained.value.value.type != GARNET_FUNCTION || !retained.value.value.as.handle)
-      throw std::runtime_error("Invalid retained function");
-  }
+  ResultGuard retained{{}};
+  explicit Function(void* host) : identity(host) {}
 };
 void free_function(mrb_state* mrb, void* p) {
   session(mrb).retire(static_cast<Function*>(p));
 }
 const mrb_data_type function_type{"AVS::Function", free_function};
 
-std::unique_ptr<Storage> from_ruby(mrb_state* mrb, mrb_value value, int depth = 0) {
+void from_ruby(mrb_state* mrb, mrb_value value, Storage* out, int depth = 0) {
   if (depth > 32)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "Array nesting too deep or cyclic");
-  auto out = std::make_unique<Storage>();
   if (mrb_nil_p(value))
-    return out;
+    return;
   if (mrb_true_p(value) || mrb_false_p(value)) {
     out->value.type = GARNET_BOOL;
     out->value.as.integer = mrb_true_p(value);
@@ -272,8 +261,10 @@ std::unique_ptr<Storage> from_ruby(mrb_state* mrb, mrb_value value, int depth = 
   } else if (mrb_array_p(value)) {
     if (RARRAY_LEN(value) > 32767)
       mrb_raise(mrb, E_RANGE_ERROR, "Array too large");
-    for (mrb_int i = 0; i < RARRAY_LEN(value); ++i)
-      out->children.push_back(from_ruby(mrb, mrb_ary_ref(mrb, value, i), depth + 1));
+    for (mrb_int i = 0; i < RARRAY_LEN(value); ++i) {
+      out->children.push_back(std::make_unique<Storage>());
+      from_ruby(mrb, mrb_ary_ref(mrb, value, i), out->children.back().get(), depth + 1);
+    }
     out->finish_array();
   } else if (mrb_data_p(value) && DATA_TYPE(value) == &clip_type && DATA_PTR(value)) {
     auto& s = session(mrb);
@@ -295,7 +286,12 @@ std::unique_ptr<Storage> from_ruby(mrb_state* mrb, mrb_value value, int depth = 
     out->value = out->pin.value;
   } else
     mrb_raise(mrb, E_TYPE_ERROR, "Expected nil, bool, integer, float, string, array, AVS::Clip or AVS::Function");
-  return out;
+}
+void append_ruby(mrb_state* mrb, mrb_value value, HostArguments& owner) {
+  // Publish ownership BEFORE conversion. A partially converted array can hold
+  // native handles even when a later element raises or an allocation fails.
+  owner.values.push_back(std::make_unique<Storage>());
+  from_ruby(mrb, value, owner.values.back().get());
 }
 
 mrb_value to_ruby(mrb_state* mrb, const garnet_value& value, int depth = 0) {
@@ -323,13 +319,23 @@ mrb_value to_ruby(mrb_state* mrb, const garnet_value& value, int depth = 0) {
       return ary;
     }
     case GARNET_CLIP: {
-      auto p = std::make_unique<Clip>(session(mrb).host, value.as.handle);
+      auto& s = session(mrb);
+      std::unique_ptr<Clip, Retire> p(new Clip(s.host.identity), Retire{s});
+      p->retained.value = s.host.retain_clip(s.host.identity, value.as.handle);
+      p->retained.check();
+      if (p->retained.value.value.type != GARNET_CLIP || !p->retained.value.value.as.handle)
+        throw std::runtime_error("Invalid retained clip");
       auto* object = mrb_data_object_alloc(mrb, session(mrb).clip_class, p.get(), &clip_type);
       p.release();
       return mrb_obj_value(object);
     }
     case GARNET_FUNCTION: {
-      auto p = std::make_unique<Function>(session(mrb).host, value.as.handle);
+      auto& s = session(mrb);
+      std::unique_ptr<Function, Retire> p(new Function(s.host.identity), Retire{s});
+      p->retained.value = s.host.retain_function(s.host.identity, value.as.handle);
+      p->retained.check();
+      if (p->retained.value.value.type != GARNET_FUNCTION || !p->retained.value.value.as.handle)
+        throw std::runtime_error("Invalid retained function");
       auto* object = mrb_data_object_alloc(mrb, session(mrb).function_class, p.get(), &function_type);
       p.release();
       return mrb_obj_value(object);
@@ -460,9 +466,9 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
     auto& owned = arguments->values;
     std::vector<std::string> names;
     if (mrb_data_p(self) && DATA_TYPE(self) == &clip_type)
-      owned.push_back(from_ruby(mrb, self));
+      append_ruby(mrb, self, *arguments);
     for (mrb_int i = function_call ? 0 : 1; i < count; ++i)
-      owned.push_back(from_ruby(mrb, values[i]));
+      append_ruby(mrb, values[i], *arguments);
     const size_t positional = owned.size();
     if (!mrb_nil_p(keywords)) {
       const auto keys = mrb_hash_keys(mrb, keywords);
@@ -478,7 +484,7 @@ mrb_value invoke(mrb_state* mrb, mrb_value self) {
         if (mrb_nil_p(value))
           continue;
         names.push_back(std::move(name_key));
-        owned.push_back(from_ruby(mrb, value));
+        append_ruby(mrb, value, *arguments);
       }
     }
     if (owned.size() > 32767)
@@ -524,7 +530,7 @@ mrb_value assign_var(mrb_state* mrb, bool global) {
     const auto name = name_of(mrb, key);
     auto& s = session(mrb);
     std::unique_ptr<HostArguments, Retire> arguments(new HostArguments, Retire{s});
-    arguments->values.push_back(from_ruby(mrb, value));
+    append_ruby(mrb, value, *arguments);
     auto owner = host_call(s, [&](void* context) {
       return s.host.set_var(s.host.identity, context, span(name), &arguments->values[0]->value, global);
     });
@@ -602,7 +608,7 @@ void check_ruby(mrb_state* mrb, mrb_bool failed, mrb_value value) {
 struct Evaluation {
   garnet_string source;
   std::string filename;
-  std::unique_ptr<Storage> output;
+  std::unique_ptr<HostArguments, Retire> output;
   bool file = false;
   bool pipeline = false;
 };
@@ -674,7 +680,7 @@ mrb_value evaluate_body(mrb_state* mrb, void* data) {
     auto& e = *static_cast<Evaluation*>(data);
     auto value = e.file ? load_file(mrb, e.filename, nullptr, !e.pipeline) : execute_source(mrb, e.source, e.filename);
     if (!mrb->exc)
-      e.output = from_ruby(mrb, value);
+      append_ruby(mrb, value, *e.output);
     return value;
   } catch (const std::exception& e) {
     mrb_raise(mrb, E_RUNTIME_ERROR, e.what());
@@ -695,7 +701,7 @@ struct CallbackCall {
   Export& entry;
   const garnet_value* args;
   size_t count;
-  std::unique_ptr<Storage> output;
+  std::unique_ptr<HostArguments, Retire> output;
 };
 mrb_value callback_body(mrb_state* mrb, void* data) {
   try {
@@ -704,8 +710,8 @@ mrb_value callback_body(mrb_state* mrb, void* data) {
     for (size_t i = 0; i < call.count; ++i)
       args.push_back(to_ruby(mrb, call.args[i]));
     auto value = mrb_yield_argv(mrb, call.entry.block, static_cast<mrb_int>(args.size()), args.data());
-    call.output = from_ruby(mrb, value);
-    const auto type = call.output->value.type;
+    append_ruby(mrb, value, *call.output);
+    const auto type = call.output->values[0]->value.type;
     bool valid = false;
     switch (call.entry.returns) {
       case '.':
@@ -756,13 +762,13 @@ garnet_result GARNET_CALL call_export(void* data, void* context, const garnet_va
     if (auto* parent = Invocation::parent(s.execution); parent && parent->depth >= 64)
       return error("Ruby callback nesting limit exceeded");
     Active active(s, lock, context);
-    CallbackCall call{entry, args, count, nullptr};
+    CallbackCall call{entry, args, count, {new HostArguments, Retire{s}}};
     mrb_bool failed = false;
     auto value = mrb_protect_error(s.ruby, callback_body, &call, &failed);
     check_ruby(s.ruby, failed, value);
     if (s.poisoned || s.import_failed)
       throw std::runtime_error("Ruby session disabled after nested failure");
-    auto out = result(std::move(call.output));
+    auto out = result(std::move(call.output->values[0]));
     active.done = true;
     return out;
   } catch (const std::exception& e) {
@@ -817,7 +823,7 @@ static garnet_result evaluate(garnet_session* s, void* context, garnet_string so
       return garnet::error("Ruby session disabled after failed evaluation");
     if (auto* parent = Invocation::parent(s->execution); parent && parent->depth >= 64)
       return garnet::error("Ruby script nesting limit exceeded");
-    Evaluation e{source, garnet::text(filename), nullptr, file, pipeline};
+    Evaluation e{source, garnet::text(filename), {new HostArguments, Retire{*s}}, file, pipeline};
     if (e.filename.find('\0') != std::string::npos)
       return garnet::error("NUL in filename");
     Active active(*s, lock, context);
@@ -826,9 +832,9 @@ static garnet_result evaluate(garnet_session* s, void* context, garnet_string so
     check_ruby(s->ruby, failed, value);
     if (s->poisoned || s->import_failed)
       throw std::runtime_error("Ruby session disabled after a failed nested import");
-    if (pipeline && (!e.output || e.output->value.type != GARNET_CLIP))
+    if (pipeline && e.output->values[0]->value.type != GARNET_CLIP)
       throw std::runtime_error("Pipeline script must return a clip");
-    auto output = garnet::result(std::move(e.output));
+    auto output = garnet::result(std::move(e.output->values[0]));
     active.done = true;
     return output;
   } catch (const std::exception& e) {
