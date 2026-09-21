@@ -99,9 +99,21 @@ if(GARNET_BUILD_TESTS)
     garnet_example_test(library_from_ruby examples/library_from_ruby.avs bicubic)
     garnet_example_test(pipeline examples/pipeline.avs pipeline)
     garnet_example_test(preset_filter examples/preset_filter.avs bilinear)
+    garnet_example_test(polyglot examples/polyglot.avs bilinear)
     garnet_example_test(function_values examples/function_values.avs bilinear)
     garnet_example_test(frame_callback examples/frame_callback.avs frame_callback)
     garnet_example_test(preset_settings tests/examples/preset_settings.avs preset_settings_reference)
     set_tests_properties(garnet_example_frame_callback PROPERTIES PROCESSORS 4)
+    add_test(NAME garnet_avs_polyglot COMMAND garnet_avs_tests
+      "${GARNET_TEST_AVS_RUNTIME}" "$<TARGET_FILE:garnet_plugin>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/polyglot.avs")
+    set_tests_properties(garnet_avs_polyglot PROPERTIES TIMEOUT 30)
+    add_test(NAME garnet_avs_polyglot_casing COMMAND garnet_avs_tests
+      "${GARNET_TEST_AVS_RUNTIME}" "$<TARGET_FILE:garnet_plugin>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/polyglot_casing.avs")
+    set_tests_properties(garnet_avs_polyglot_casing PROPERTIES TIMEOUT 30)
+    add_test(NAME garnet_avs_autoload COMMAND garnet_avs_tests
+      "${GARNET_TEST_AVS_RUNTIME}" "$<TARGET_FILE:garnet_plugin>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/autoload_test.avs"
+      --autoload "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/autoload/dir1"
+      --autoload "${CMAKE_CURRENT_SOURCE_DIR}/tests/ruby/autoload/dir2")
+    set_tests_properties(garnet_avs_autoload PROPERTIES TIMEOUT 30)
   endif()
 endif()

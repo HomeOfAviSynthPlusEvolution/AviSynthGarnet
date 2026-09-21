@@ -9,13 +9,31 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-  const bool stamp = argc == 5 && std::strcmp(argv[4], "stamp") == 0;
-  const bool reference_script = argc == 6 && std::strcmp(argv[4], "--reference") == 0;
-  if (argc != 4 && !stamp && !reference_script) {
-    std::fprintf(stderr, "usage: avs_tests runtime plugin script [stamp | --reference native.avs]\n");
+  if (argc < 4) {
+    std::fprintf(stderr, "usage: avs_tests runtime plugin script [stamp | --reference native.avs] [--autoload dir]\n");
     return 2;
   }
-  auto dll = LoadLibraryA(argv[1]);
+  const char* runtime_path = argv[1];
+  const char* plugin_path = argv[2];
+  const char* script_path = argv[3];
+  const char* reference_path = nullptr;
+  std::vector<const char*> autoload_dirs;
+  bool stamp = false;
+
+  for (int i = 4; i < argc; ++i) {
+    if (std::strcmp(argv[i], "stamp") == 0) {
+      stamp = true;
+    } else if (std::strcmp(argv[i], "--reference") == 0 && i + 1 < argc) {
+      reference_path = argv[++i];
+    } else if (std::strcmp(argv[i], "--autoload") == 0 && i + 1 < argc) {
+      autoload_dirs.push_back(argv[++i]);
+    } else {
+      std::fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
+      return 2;
+    }
+  }
+  const bool reference_script = reference_path != nullptr;
+  auto dll = LoadLibraryA(runtime_path);
   if (!dll) {
     std::fprintf(stderr, "Cannot load runtime: %lu\n", GetLastError());
     return 1;
@@ -69,9 +87,19 @@ int main(int argc, char** argv) {
       throw std::runtime_error(message);
     }
     avs_release_value(cleared);
-    auto loaded = call("LoadPlugin", argv[2]);
+    for (const char* dir : autoload_dirs) {
+      AVS_Value args[2] = {avs_new_value_string(dir), avs_new_value_bool(false)};
+      auto added = avs_invoke(env, "AddAutoloadDir", avs_new_value_array(args, 2), nullptr);
+      if (avs_is_error(added)) {
+        const std::string message = avs_as_string(added);
+        avs_release_value(added);
+        throw std::runtime_error(message);
+      }
+      avs_release_value(added);
+    }
+    auto loaded = call("LoadPlugin", plugin_path);
     avs_release_value(loaded);
-    auto output = call("Import", argv[3]);
+    auto output = call("Import", script_path);
     if (!avs_is_clip(output)) {
       avs_release_value(output);
       throw std::runtime_error("Ruby main did not return clip");
@@ -80,7 +108,7 @@ int main(int argc, char** argv) {
     avs_release_value(output);
     auto expected =
         reference_script
-            ? call("Import", argv[5])
+            ? call("Import", reference_path)
             : call("Eval", stamp
                                ? "ColorBars(width=720,height=480,pixel_type=\"YV12\").ScriptClip(\"last.BilinearResize("
                                  "360,240).PointResize(720,480)\").PointResize(360,240)"

@@ -2,10 +2,12 @@
 #include <garnet/engine.h>
 #include "result.hpp"
 #include "template_cache.hpp"
+#include <algorithm>
 #include <filesystem>
 #include <limits>
-#include <unordered_set>
 #include <mutex>
+#include <string_view>
+#include <unordered_set>
 
 const AVS_Linkage* AVS_linkage = nullptr;
 namespace {
@@ -563,6 +565,134 @@ AVSValue __cdecl import_ruby(AVSValue args, void* data, IScriptEnvironment* env)
   }
   return AVSValue();
 }
+AVSValue __cdecl import_self_ruby(AVSValue args, void* data, IScriptEnvironment* env) {
+  auto& host = *static_cast<Host*>(data);
+  try {
+    std::filesystem::path path;
+    if (args[0].Defined() && args[0].IsString() && std::strlen(args[0].AsString()) > 0) {
+      path = std::filesystem::u8path(args[0].AsString());
+      if (path.is_relative()) {
+        auto dir = env->GetVarDef("$ScriptDirUtf8$");
+        if (dir.IsString())
+          path = std::filesystem::u8path(dir.AsString()) / path;
+      }
+    } else {
+      auto name_var = env->GetVarDef("$ScriptNameUtf8$");
+      if (!name_var.IsString() || std::strlen(name_var.AsString()) == 0)
+        name_var = env->GetVarDef("$ScriptName$");
+      if (!name_var.IsString() || std::strlen(name_var.AsString()) == 0)
+        throw std::runtime_error("unable to resolve current script path ($ScriptNameUtf8$ not set)");
+      path = std::filesystem::u8path(name_var.AsString());
+    }
+    path = std::filesystem::absolute(path).lexically_normal();
+    const auto filename = path.u8string();
+    ResultGuard r(garnet_import(host.session, env, span(filename)));
+    if (r.value.status != GARNET_OK)
+      throw std::runtime_error(filename + ": " + text(r.value.error));
+    return to_avs(host, env, r.value.value);
+  } catch (const std::exception& e) {
+    env->ThrowError("ruby: %s", e.what());
+  }
+  return AVSValue();
+}
+static bool streq_ci(std::string_view a, std::string_view b) {
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    char ca = (a[i] >= 'A' && a[i] <= 'Z') ? static_cast<char>(a[i] + ('a' - 'A')) : a[i];
+    char cb = (b[i] >= 'A' && b[i] <= 'Z') ? static_cast<char>(b[i] + ('a' - 'A')) : b[i];
+    if (ca != cb)
+      return false;
+  }
+  return true;
+}
+void scan_autoload_libraries(Host& host, IScriptEnvironment* env) {
+  std::string disable_str;
+#if defined(_WIN32)
+  char* buf = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&buf, &len, "GARNET_DISABLE_AUTOLOAD") == 0 && buf) {
+    disable_str = buf;
+    std::free(buf);
+  }
+#else
+  if (const char* env_p = std::getenv("GARNET_DISABLE_AUTOLOAD"))
+    disable_str = env_p;
+#endif
+  if (!disable_str.empty() && (disable_str == "1" || streq_ci(disable_str, "true")))
+    return;
+  AVSValue dir_list_val;
+  try {
+    dir_list_val = env->Invoke("ListAutoloadDirs", AVSValue(nullptr, 0));
+  } catch (const IScriptEnvironment::NotFound&) {
+    return;
+  } catch (...) {
+    return;
+  }
+  if (!dir_list_val.IsString())
+    return;
+
+  std::string_view dir_list_str(dir_list_val.AsString());
+  std::unordered_set<std::string> loaded_basenames;
+
+  size_t start = 0;
+  while (start < dir_list_str.size()) {
+    size_t end = dir_list_str.find('\n', start);
+    if (end == std::string_view::npos)
+      end = dir_list_str.size();
+    auto dir_token = dir_list_str.substr(start, end - start);
+    while (!dir_token.empty() && (dir_token.back() == '\r' || dir_token.back() == ' '))
+      dir_token.remove_suffix(1);
+    while (!dir_token.empty() && dir_token.front() == ' ')
+      dir_token.remove_prefix(1);
+
+    start = end + 1;
+    if (dir_token.empty())
+      continue;
+
+    std::error_code ec;
+    auto dir_path = std::filesystem::u8path(dir_token);
+    if (!std::filesystem::is_directory(dir_path, ec))
+      continue;
+
+    std::vector<std::filesystem::path> candidate_files;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             dir_path, std::filesystem::directory_options::skip_permission_denied, ec)) {
+      if (ec)
+        break;
+      if (!entry.is_regular_file(ec))
+        continue;
+      auto filename = entry.path().filename().u8string();
+      constexpr std::string_view suffix = ".avs.rb";
+      if (filename.size() > suffix.size()) {
+        std::string_view file_suffix(filename.data() + (filename.size() - suffix.size()), suffix.size());
+        if (streq_ci(file_suffix, suffix))
+          candidate_files.push_back(entry.path());
+      }
+    }
+
+    std::sort(candidate_files.begin(), candidate_files.end(), [](const auto& a, const auto& b) {
+      return a.filename().u8string() < b.filename().u8string();
+    });
+
+    for (const auto& file : candidate_files) {
+      auto filename = file.filename().u8string();
+      std::string base_name = filename.substr(0, filename.size() - 7);
+      for (auto& c : base_name)
+        if (c >= 'A' && c <= 'Z')
+          c += 'a' - 'A';
+      if (loaded_basenames.count(base_name) > 0)
+        continue;
+      loaded_basenames.insert(base_name);
+
+      auto canonical_path = std::filesystem::absolute(file).lexically_normal();
+      const auto u8_canonical = canonical_path.u8string();
+      ResultGuard r(garnet_import(host.session, env, span(u8_canonical)));
+      if (r.value.status != GARNET_OK)
+        throw std::runtime_error("Autoload '" + u8_canonical + "': " + text(r.value.error));
+    }
+  }
+}
 void __cdecl shutdown(void* p, IScriptEnvironment*) {
   delete static_cast<Host*>(p);
 }
@@ -581,6 +711,8 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
       throw std::runtime_error("ImportRuby already registered");
     if (env->FunctionExists("ImportScript"))
       throw std::runtime_error("ImportScript already registered");
+    if (env->FunctionExists("ruby"))
+      throw std::runtime_error("ruby already registered");
     if (env->FunctionExists("__GarnetDispatch"))
       throw std::runtime_error("Garnet dispatcher already registered");
     auto host = std::make_unique<Host>();
@@ -602,11 +734,13 @@ extern "C" GARNET_EXPORT const char* __stdcall AvisynthPluginInit3(IScriptEnviro
                  make_function};
     ResultGuard r(garnet_create(&host->api, &host->session));
     r.check();
-    env->AtExit(shutdown, host.get());
-    auto* owned = host.release();
+    auto* owned = host.get();
     env->AddFunction("ImportRuby", "s", import_ruby, owned);
     env->AddFunction("ImportScript", "cs", import_script, owned);
+    env->AddFunction("ruby", "[file]s", import_self_ruby, owned);
     env->AddFunction("__GarnetDispatch", "c[args].", dispatch_function, owned);
+    scan_autoload_libraries(*owned, env);
+    env->AtExit(shutdown, host.release());
     return "Garnet Ruby binding";
   } catch (const std::exception& e) {
     env->ThrowError("Garnet initialization: %s", e.what());

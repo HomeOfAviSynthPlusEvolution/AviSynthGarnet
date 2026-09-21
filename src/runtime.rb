@@ -5,6 +5,21 @@ module Kernel
     raise TypeError, 'last is not a clip' unless clip.is_a?(AVS::Clip)
     clip
   end
+
+  # Header launcher support for polyglot `.avs` scripts (e.g. `ruby __END__`).
+  def ruby(*); end
+  def __END__(*); end
+
+  def method_missing(name, *args, &block)
+    text = name.to_s.downcase
+    return nil if text == 'ruby' || text == '__end__'
+    super
+  end
+
+  def respond_to_missing?(name, include_private = false)
+    text = name.to_s.downcase
+    text == 'ruby' || text == '__end__' || super
+  end
 end
 
 module AVS
